@@ -121,18 +121,18 @@ def install():
         f.write(CHESS_INI_CONTENT)
     print(f"  Created config: {config_path}")
 
-    # 8. Add Policy to ocean/torch.py
+    # 8. Add/update Policy in ocean/torch.py
     torch_py = os.path.join(ocean_dir, 'torch.py')
     with open(torch_py, 'r') as f:
         torch_content = f.read()
 
-    if 'class Chess(' not in torch_content:
-        torch_content += CHESS_POLICY_CONTENT
-        with open(torch_py, 'w') as f:
-            f.write(torch_content)
-        print("  Added Chess policy to torch.py")
-    else:
-        print("  Chess policy already in torch.py")
+    marker = '\n# === Chess Self-Play Policy ==='
+    if marker in torch_content:
+        torch_content = torch_content[:torch_content.index(marker)]
+    torch_content += CHESS_POLICY_CONTENT
+    with open(torch_py, 'w') as f:
+        f.write(torch_content)
+    print("  Updated Chess policy in torch.py")
 
     # Clear Python caches
     for root, dirs, files in os.walk(ocean_dir):

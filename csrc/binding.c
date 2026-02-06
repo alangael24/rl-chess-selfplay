@@ -120,9 +120,9 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         game->obs_stride   = obs_stride_bytes;  /* distance from white obs to black obs */
 
         /* actions: point to the white agent slot; game reads [0] for white, [1] for black.
-         * For int64 actions (8 bytes), we cast via char* arithmetic.
-         * For int32 actions (4 bytes), same logic. ChessEnv expects int*. */
-        game->actions   = (int*)((char*)act_data + white_idx * act_itemsize);
+         * get_action() in chess.h handles int32 vs int64 via action_itemsize. */
+        game->actions        = (char*)act_data + white_idx * act_itemsize;
+        game->action_itemsize = act_itemsize;
 
         game->rewards   = rew_data + white_idx;
         game->terminals = term_data + white_idx;

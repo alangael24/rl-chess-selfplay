@@ -72,7 +72,8 @@ typedef struct Log {
 
 typedef struct ChessEnv {
     unsigned char* observations;
-    int* actions;
+    void* actions;
+    int action_itemsize;  /* 4 (int32) or 8 (int64) */
     float* rewards;
     unsigned char* terminals;
     Log log;
@@ -90,6 +91,13 @@ typedef struct ChessEnv {
     float illegal_move_penalty;
     uint64_t rng_state;
 } ChessEnv;
+
+/* Read action[idx] respecting the actual numpy dtype (int32 or int64). */
+static inline int get_action(const ChessEnv* env, int idx) {
+    if (env->action_itemsize == 8)
+        return (int)((int64_t*)env->actions)[idx];
+    return ((int32_t*)env->actions)[idx];
+}
 
 // ============================================================================
 // Pre-computed move tables
@@ -856,7 +864,7 @@ void c_step(ChessEnv* env) {
     int opponent = 1 - player;
 
     // Read current player's action
-    int action = env->actions[player];
+    int action = get_action(env, player);
     int from_sq = action / 64;
     int to_sq = action % 64;
 

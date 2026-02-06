@@ -235,7 +235,7 @@ import gymnasium
 import pufferlib
 from pufferlib.ocean.chess import binding
 
-OBS_SIZE = 72   # 64 board squares + 8 metadata bytes
+OBS_SIZE = 4168   # 64 board + 8 metadata + 4096 action mask
 NUM_ACTIONS = 4096  # 64 * 64 (from_square * 64 + to_square)
 
 
@@ -375,10 +375,9 @@ class Chess(nn.Module):
 
     def forward_eval(self, x, state=None):
         batch_size = x.shape[0]
-        x = x.long()
-
-        board = x[:, :CHESS_BOARD_SIZE]
-        meta = x[:, CHESS_BOARD_SIZE:].float()
+        board = x[:, :CHESS_BOARD_SIZE].long()
+        meta = x[:, CHESS_BOARD_SIZE:CHESS_BOARD_SIZE + 8].float()
+        action_mask = x[:, CHESS_BOARD_SIZE + 8:] > 0
 
         board = torch.clamp(board, 0, CHESS_NUM_PIECE_TYPES - 1)
         board_emb = self.piece_embedding(board)
@@ -392,7 +391,14 @@ class Chess(nn.Module):
         for block in self.blocks:
             x = block(x)
 
-        return self.actor(x), self.critic(x)
+        logits = self.actor(x)
+        masked_logits = logits.masked_fill(~action_mask, -1e9)
+
+        all_masked = ~action_mask.any(dim=1)
+        if all_masked.any():
+            masked_logits[all_masked] = logits[all_masked]
+
+        return masked_logits, self.critic(x)
 
     def forward(self, x, state=None):
         return self.forward_eval(x, state)

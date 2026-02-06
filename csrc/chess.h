@@ -729,9 +729,11 @@ static int check_game_end(ChessEnv* env, int has_legal) {
 static void fill_action_masks(ChessEnv* env,
                               unsigned char* white_mask,
                               unsigned char* black_mask) {
-    /* Keep non-turn/terminal masks valid to avoid all-masked logits rows. */
-    memset(white_mask, 1, CHESS_MASK_SIZE);
-    memset(black_mask, 1, CHESS_MASK_SIZE);
+    /* Default to a single valid noop action for non-turn/terminal rows. */
+    memset(white_mask, 0, CHESS_MASK_SIZE);
+    memset(black_mask, 0, CHESS_MASK_SIZE);
+    white_mask[0] = 1;
+    black_mask[0] = 1;
 
     if (env->terminals[0]) {
         return;

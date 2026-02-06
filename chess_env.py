@@ -15,7 +15,7 @@ import gymnasium
 import pufferlib
 from csrc import binding
 
-OBS_SIZE = 72   # 64 board squares + 8 metadata bytes
+OBS_SIZE = 4168   # 64 board + 8 metadata + 4096 action mask
 NUM_ACTIONS = 4096  # 64 * 64 (from_square * 64 + to_square)
 
 

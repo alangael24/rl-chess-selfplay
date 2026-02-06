@@ -25,8 +25,10 @@
 // Constants
 // ============================================================================
 
-#define CHESS_OBS_SIZE 72
 #define CHESS_NUM_ACTIONS 4096
+#define CHESS_META_SIZE 8
+#define CHESS_MASK_SIZE CHESS_NUM_ACTIONS
+#define CHESS_OBS_SIZE (64 + CHESS_META_SIZE + CHESS_MASK_SIZE)
 #define CHESS_MAX_MOVES 256
 
 #define EMPTY 0
@@ -724,9 +726,35 @@ static int check_game_end(ChessEnv* env, int has_legal) {
 // Observation writing
 // ============================================================================
 
+static void fill_action_masks(ChessEnv* env,
+                              unsigned char* white_mask,
+                              unsigned char* black_mask) {
+    /* Keep non-turn/terminal masks valid to avoid all-masked logits rows. */
+    memset(white_mask, 1, CHESS_MASK_SIZE);
+    memset(black_mask, 1, CHESS_MASK_SIZE);
+
+    if (env->terminals[0]) {
+        return;
+    }
+
+    int legal_moves[CHESS_MAX_MOVES];
+    int num_legal = generate_legal_moves(env, legal_moves, CHESS_MAX_MOVES);
+    if (num_legal <= 0) {
+        return;
+    }
+
+    unsigned char* active_mask = (env->current_player == 0) ? white_mask : black_mask;
+    memset(active_mask, 0, CHESS_MASK_SIZE);
+    for (int i = 0; i < num_legal; i++) {
+        active_mask[legal_moves[i]] = 1;
+    }
+}
+
 static void write_observations(ChessEnv* env) {
     unsigned char* white_obs = env->observations;
     unsigned char* black_obs = env->observations + env->obs_stride;
+    unsigned char* white_mask = white_obs + 64 + CHESS_META_SIZE;
+    unsigned char* black_mask = black_obs + 64 + CHESS_META_SIZE;
 
     // Write board for White (agent 0): as-is
     for (int sq = 0; sq < 64; sq++) {
@@ -784,6 +812,8 @@ static void write_observations(ChessEnv* env) {
     }
     black_obs[70] = (env->halfmove_clock > 255) ? 255 : (unsigned char)env->halfmove_clock;
     black_obs[71] = (env->fullmove_number > 255) ? 255 : (unsigned char)env->fullmove_number;
+
+    fill_action_masks(env, white_mask, black_mask);
 }
 
 // ============================================================================

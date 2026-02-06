@@ -69,10 +69,9 @@ class Policy(nn.Module):
 
     def forward_eval(self, x, state=None):
         batch_size = x.shape[0]
-        x = x.long()
-
-        board = x[:, :BOARD_SIZE]
-        meta = x[:, BOARD_SIZE:].float()
+        board = x[:, :BOARD_SIZE].long()
+        meta = x[:, BOARD_SIZE:BOARD_SIZE + 8].float()
+        action_mask = x[:, BOARD_SIZE + 8:] > 0
 
         board = torch.clamp(board, 0, NUM_PIECE_TYPES - 1)
         board_emb = self.piece_embedding(board)
@@ -86,7 +85,15 @@ class Policy(nn.Module):
         for block in self.blocks:
             x = block(x)
 
-        return self.actor(x), self.critic(x)
+        logits = self.actor(x)
+        masked_logits = logits.masked_fill(~action_mask, -1e9)
+
+        # Safety fallback for unexpected all-zero masks.
+        all_masked = ~action_mask.any(dim=1)
+        if all_masked.any():
+            masked_logits[all_masked] = logits[all_masked]
+
+        return masked_logits, self.critic(x)
 
     def forward(self, x, state=None):
         return self.forward_eval(x, state)

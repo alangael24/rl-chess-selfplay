@@ -3,6 +3,11 @@
 Both White and Black agents share the same policy network.
 The policy learns to play chess through self-play.
 
+Two-phase action system (97 actions):
+  Phase 0: Pick a piece (action 0-63 = board square)
+  Phase 1: Pick destination (0-63) or promotion (64-95)
+  Action 96: PASS (valid when it's NOT this player's turn)
+
 Two ways to train:
   1. PufferLib CLI (recommended):
      python install_cli.py  # one-time setup
@@ -28,39 +33,62 @@ from chess_env import Chess, OBS_SIZE, NUM_ACTIONS
 BOARD_SIZE = 64
 NUM_PIECE_TYPES = 13  # 0=empty, 1-6=white pieces, 7-12=black pieces
 
+# Observation layout offsets
+OBS_BOARD = 0        # 64 bytes
+OBS_SIDE = 64        # 2 bytes (one-hot: is_my_turn)
+OBS_CASTLING = 66    # 4 bytes
+OBS_EP = 70          # 1 byte
+OBS_PHASE = 71       # 2 bytes (one-hot: phase 0 or 1)
+OBS_SELECTED = 73    # 64 bytes (one-hot selected piece plane)
+OBS_VALID_PIECES = 137  # 64 bytes
+OBS_VALID_DESTS = 201   # 64 bytes
+OBS_VALID_PROMOS = 265  # 32 bytes
+OBS_SELF_CHECK = 297    # 1 byte
+OBS_OPP_CHECK = 298     # 1 byte
+OBS_RULE50 = 299        # 1 byte
+OBS_PASS_VALID = 300    # 1 byte
+
 
 class ResidualBlock(nn.Module):
-    def __init__(self, h):
+    def __init__(self, c):
         super().__init__()
-        self.fc1 = nn.Linear(h, h)
-        self.fc2 = nn.Linear(h, h)
-        self.ln1 = nn.LayerNorm(h)
-        self.ln2 = nn.LayerNorm(h)
+        self.conv1 = nn.Conv2d(c, c, kernel_size=3, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(c, c, kernel_size=3, padding=1, bias=False)
+        self.gn1 = nn.GroupNorm(8, c)
+        self.gn2 = nn.GroupNorm(8, c)
 
     def forward(self, x):
-        return F.relu(self.ln2(self.fc2(F.relu(self.ln1(self.fc1(x))))) + x)
+        y = F.relu(self.gn1(self.conv1(x)))
+        y = self.gn2(self.conv2(y))
+        return F.relu(y + x)
 
 
 class Policy(nn.Module):
     def __init__(self, env, hidden_size=256, num_blocks=2):
         super().__init__()
 
-        self.piece_embedding = nn.Embedding(NUM_PIECE_TYPES, 32)
+        # CNN input: 13 board channels + 3 spatial channels (valid_pieces, valid_dests, selected_piece)
+        conv_in = NUM_PIECE_TYPES + 3
+        conv_channels = 64
+        self.board_stem = nn.Conv2d(
+            conv_in, conv_channels, kernel_size=3, padding=1, bias=False)
+        self.board_gn = nn.GroupNorm(8, conv_channels)
+        self.board_blocks = nn.ModuleList([
+            ResidualBlock(conv_channels) for _ in range(num_blocks)
+        ])
+        self.board_proj = pufferlib.pytorch.layer_init(
+            nn.Linear(conv_channels * 8 * 8, hidden_size))
 
-        self.meta_encoder = nn.Sequential(
-            nn.Linear(8, 64),
+        # Scalar features: side(2) + castling(4) + ep(1) + phase(2) + check(2) + rule50(1) + pass_valid(1) + promos(32) = 45
+        self.scalar_encoder = nn.Sequential(
+            nn.Linear(45, 128),
             nn.ReLU(),
-            nn.Linear(64, 64),
+            nn.Linear(128, 64),
         )
 
-        board_feat_size = BOARD_SIZE * 32
-        self.input_fc = pufferlib.pytorch.layer_init(
-            nn.Linear(board_feat_size + 64, hidden_size))
-        self.input_ln = nn.LayerNorm(hidden_size)
-
-        self.blocks = nn.ModuleList([
-            ResidualBlock(hidden_size) for _ in range(num_blocks)
-        ])
+        self.fusion_fc = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size + 64, hidden_size))
+        self.fusion_ln = nn.LayerNorm(hidden_size)
 
         self.actor = pufferlib.pytorch.layer_init(
             nn.Linear(hidden_size, NUM_ACTIONS), std=0.01)
@@ -69,31 +97,79 @@ class Policy(nn.Module):
 
     def forward_eval(self, x, state=None):
         batch_size = x.shape[0]
-        board = x[:, :BOARD_SIZE].long()
-        meta = x[:, BOARD_SIZE:BOARD_SIZE + 8].float()
-        action_mask = x[:, BOARD_SIZE + 8:] > 0
 
+        # Parse observation
+        board = x[:, OBS_BOARD:OBS_BOARD + 64].long()
+        side = x[:, OBS_SIDE:OBS_SIDE + 2].float() / 255.0
+        castling = x[:, OBS_CASTLING:OBS_CASTLING + 4].float() / 255.0
+        ep = x[:, OBS_EP:OBS_EP + 1].float() / 255.0
+        phase = x[:, OBS_PHASE:OBS_PHASE + 2].float() / 255.0
+        selected = x[:, OBS_SELECTED:OBS_SELECTED + 64].float() / 255.0
+        valid_pieces = x[:, OBS_VALID_PIECES:OBS_VALID_PIECES + 64].float() / 255.0
+        valid_dests = x[:, OBS_VALID_DESTS:OBS_VALID_DESTS + 64].float() / 255.0
+        valid_promos = x[:, OBS_VALID_PROMOS:OBS_VALID_PROMOS + 32].float() / 255.0
+        self_check = x[:, OBS_SELF_CHECK:OBS_SELF_CHECK + 1].float() / 255.0
+        opp_check = x[:, OBS_OPP_CHECK:OBS_OPP_CHECK + 1].float() / 255.0
+        rule50 = x[:, OBS_RULE50:OBS_RULE50 + 1].float() / 255.0
+        pass_valid = x[:, OBS_PASS_VALID:OBS_PASS_VALID + 1].float() / 255.0
+
+        # Board one-hot -> 13 channels 8x8
         board = torch.clamp(board, 0, NUM_PIECE_TYPES - 1)
-        board_emb = self.piece_embedding(board)
-        board_flat = board_emb.reshape(batch_size, -1)
+        board_oh = F.one_hot(board, num_classes=NUM_PIECE_TYPES).float()
+        board_oh = board_oh.view(batch_size, 8, 8, NUM_PIECE_TYPES).permute(0, 3, 1, 2)
 
-        meta_feat = self.meta_encoder(meta)
+        # Spatial channels: valid_pieces, valid_dests, selected_piece -> each 8x8
+        vp_plane = valid_pieces.view(batch_size, 1, 8, 8)
+        vd_plane = valid_dests.view(batch_size, 1, 8, 8)
+        sp_plane = selected.view(batch_size, 1, 8, 8)
 
-        combined = torch.cat([board_flat, meta_feat], dim=1)
-        x = F.relu(self.input_ln(self.input_fc(combined)))
+        # Concatenate: 13 + 3 = 16 channels
+        spatial = torch.cat([board_oh, vp_plane, vd_plane, sp_plane], dim=1)
 
-        for block in self.blocks:
-            x = block(x)
+        board_x = F.relu(self.board_gn(self.board_stem(spatial)))
+        for block in self.board_blocks:
+            board_x = block(board_x)
 
-        logits = self.actor(x)
-        masked_logits = logits.masked_fill(~action_mask, -1e9)
+        board_feat = board_x.reshape(batch_size, -1)
+        board_feat = F.relu(self.board_proj(board_feat))
 
-        # Safety fallback for unexpected all-zero masks.
-        all_masked = ~action_mask.any(dim=1)
+        # Scalar features
+        scalars = torch.cat([side, castling, ep, phase, self_check, opp_check, rule50, pass_valid, valid_promos], dim=1)
+        scalar_feat = self.scalar_encoder(scalars)
+
+        combined = torch.cat([board_feat, scalar_feat], dim=1)
+        feat = F.relu(self.fusion_ln(self.fusion_fc(combined)))
+
+        logits = self.actor(feat)
+
+        # Build action mask from observation
+        # Phase 0: valid actions are valid_pieces squares (0-63) + pass
+        # Phase 1: valid actions are valid_dests squares (0-63) + valid_promos (64-95) + pass
+        is_phase0 = phase[:, 0:1] > 0.5  # (batch, 1)
+
+        mask = torch.zeros(batch_size, NUM_ACTIONS, device=x.device, dtype=torch.bool)
+
+        # Squares 0-63
+        vp_bool = valid_pieces > 0.5  # (batch, 64)
+        vd_bool = valid_dests > 0.5   # (batch, 64)
+        mask[:, :64] = torch.where(is_phase0, vp_bool, vd_bool)
+
+        # Promotions 64-95
+        promo_bool = valid_promos > 0.5  # (batch, 32)
+        mask[:, 64:96] = torch.where(is_phase0, torch.zeros_like(promo_bool), promo_bool)
+
+        # Pass action 96
+        pass_bool = pass_valid.squeeze(-1) > 0.5  # (batch,)
+        mask[:, 96] = pass_bool
+
+        masked_logits = logits.masked_fill(~mask, -1e9)
+
+        # Safety fallback for unexpected all-zero masks
+        all_masked = ~mask.any(dim=1)
         if all_masked.any():
             masked_logits[all_masked] = logits[all_masked]
 
-        return masked_logits, self.critic(x)
+        return masked_logits, self.critic(feat)
 
     def forward(self, x, state=None):
         return self.forward_eval(x, state)
@@ -102,6 +178,7 @@ class Policy(nn.Module):
 if __name__ == "__main__":
     print("=" * 60)
     print("CHESS SELF-PLAY TRAINING (standalone)")
+    print("Two-phase action system: 97 actions")
     print("Tip: use 'puffer train puffer_chess' for CLI mode")
     print("=" * 60)
 
@@ -136,6 +213,10 @@ if __name__ == "__main__":
             'num_envs': NUM_GAMES,
             'max_steps': 256,
             'illegal_move_penalty': -0.1,
+            'reward_invalid_piece': -0.01,
+            'reward_invalid_move': -0.01,
+            'reward_valid_piece': 0.0,
+            'reward_valid_move': 0.0,
         },
         num_envs=1,
         backend=pufferlib.PufferEnv,

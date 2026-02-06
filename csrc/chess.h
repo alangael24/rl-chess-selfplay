@@ -5,12 +5,15 @@
  * per game instance. Designed for high-performance reinforcement learning
  * with PufferLib Ocean conventions.
  *
+ * Two-phase action system (97 actions):
+ *   Phase 0: Pick a piece (action 0-63 = board square)
+ *   Phase 1: Pick destination (0-63) or promotion (64-95)
+ *   Action 96: PASS (valid when it's NOT this player's turn)
+ *
  * Board representation: array of 64 int8_t values
  *   square = row * 8 + col
  *   row 0 = rank 1 (White back rank), row 7 = rank 8 (Black back rank)
  *   a1=0, b1=1, ..., h1=7, a2=8, ..., h8=63
- *
- * Move encoding: from_sq * 64 + to_sq (0-4095)
  *
  * Pieces: 0=empty, 1-6=White(P,N,B,R,Q,K), 7-12=Black(P,N,B,R,Q,K)
  */
@@ -25,11 +28,16 @@
 // Constants
 // ============================================================================
 
-#define CHESS_NUM_ACTIONS 4096
-#define CHESS_META_SIZE 8
-#define CHESS_MASK_SIZE CHESS_NUM_ACTIONS
-#define CHESS_OBS_SIZE (64 + CHESS_META_SIZE + CHESS_MASK_SIZE)
+#define CHESS_NUM_ACTIONS 97       // 64 squares + 32 promotions + 1 pass
+#define CHESS_PASS_ACTION 96
 #define CHESS_MAX_MOVES 256
+
+// Observation layout (per player):
+//   64 board + 2 side + 4 castling + 1 ep + 2 phase + 64 selected_piece
+//   + 64 valid_pieces + 64 valid_dests + 32 valid_promos
+//   + 1 self_check + 1 opp_check + 1 rule50 + 1 pass_valid
+// Total = 301
+#define CHESS_OBS_SIZE 301
 
 #define EMPTY 0
 #define WP 1
@@ -72,6 +80,14 @@ typedef struct Log {
     float n;
 } Log;
 
+// Per-player two-phase state
+typedef struct {
+    int pick_phase;           // 0=pick piece, 1=pick destination
+    int selected_square;      // square picked in phase 0 (-1 if none)
+    int valid_dest_moves[CHESS_MAX_MOVES]; // legal moves from selected_square (encoded as from*64+to)
+    int valid_dest_count;
+} PhaseState;
+
 typedef struct ChessEnv {
     unsigned char* observations;
     void* actions;
@@ -92,6 +108,15 @@ typedef struct ChessEnv {
     int max_steps;
     float illegal_move_penalty;
     uint64_t rng_state;
+
+    // Two-phase state per player (0=White, 1=Black)
+    PhaseState phase_state[2];
+
+    // Reward config for two-phase actions
+    float reward_invalid_piece;   // default -0.01
+    float reward_invalid_move;    // default -0.01
+    float reward_valid_piece;     // default 0.0
+    float reward_valid_move;      // default 0.0
 } ChessEnv;
 
 /* Read action[idx] respecting the actual numpy dtype (int32 or int64). */
@@ -591,7 +616,10 @@ static int has_any_legal_move(ChessEnv* env) {
 // Move application
 // ============================================================================
 
-static void apply_move(ChessEnv* env, int from_sq, int to_sq) {
+// Apply a move with explicit promotion piece type.
+// promo_piece: the actual piece to place (e.g. WQ, WR, WB, WN, or BQ etc.)
+//              Pass EMPTY (0) for auto-queen or non-promotion moves.
+static void apply_move_ex(ChessEnv* env, int from_sq, int to_sq, int8_t promo_piece) {
     int8_t piece = env->board[from_sq];
     int8_t captured = env->board[to_sq];
     int player = env->current_player;
@@ -613,11 +641,16 @@ static void apply_move(ChessEnv* env, int from_sq, int to_sq) {
     env->board[to_sq] = piece;
     env->board[from_sq] = EMPTY;
 
-    // Pawn promotion (auto-queen)
+    // Pawn promotion
     if (ptype == WP) {
         int promo_row = (player == 0) ? 7 : 0;
         if (sq_row(to_sq) == promo_row) {
-            env->board[to_sq] = (player == 0) ? WQ : BQ;
+            if (promo_piece != EMPTY) {
+                env->board[to_sq] = promo_piece;
+            } else {
+                // Auto-queen fallback
+                env->board[to_sq] = (player == 0) ? WQ : BQ;
+            }
         }
     }
 
@@ -674,6 +707,11 @@ static void apply_move(ChessEnv* env, int from_sq, int to_sq) {
     }
 }
 
+// Legacy wrapper: auto-queen promotion
+static void apply_move(ChessEnv* env, int from_sq, int to_sq) {
+    apply_move_ex(env, from_sq, to_sq, EMPTY);
+}
+
 // ============================================================================
 // Game end detection
 // ============================================================================
@@ -723,40 +761,230 @@ static int check_game_end(ChessEnv* env, int has_legal) {
 }
 
 // ============================================================================
+// Two-phase action processing
+// ============================================================================
+
+// Check if a move from from_sq to to_sq is a promotion move
+static inline int is_promotion_move(ChessEnv* env, int from_sq, int to_sq) {
+    int8_t piece = env->board[from_sq];
+    int ptype = piece;
+    if (ptype >= BP) ptype -= 6;
+    if (ptype != WP) return 0;
+    int player = env->current_player;
+    int promo_row = (player == 0) ? 7 : 0;
+    return sq_row(to_sq) == promo_row;
+}
+
+// Flip a square for Black's perspective (row flip, col stays)
+static inline int flip_sq(int sq) {
+    int r = sq_row(sq);
+    int c = sq_col(sq);
+    return make_sq(7 - r, c);
+}
+
+// Process a player's action in the two-phase system.
+// Returns 1 if a chess move was completed (board changed, turn should switch).
+// Returns 0 if still in sub-step (phase change or pass).
+static int process_player_action(ChessEnv* env, int action, int player) {
+    PhaseState* ps = &env->phase_state[player];
+
+    // PASS action
+    if (action == CHESS_PASS_ACTION) {
+        // Pass is valid when it's NOT this player's turn
+        if (env->current_player != player) {
+            return 0; // Valid pass, no move
+        }
+        // Invalid pass (it IS our turn) - penalize
+        env->rewards[player] += env->reward_invalid_move;
+        env->log.illegal_moves += 1.0f;
+        return 0;
+    }
+
+    // If it's not our turn, any non-pass action is invalid
+    if (env->current_player != player) {
+        env->rewards[player] += env->reward_invalid_move;
+        env->log.illegal_moves += 1.0f;
+        return 0;
+    }
+
+    if (ps->pick_phase == 0) {
+        // Phase 0: Pick a piece
+        if (action < 0 || action > 63) {
+            env->rewards[player] += env->reward_invalid_piece;
+            env->log.illegal_moves += 1.0f;
+            return 0;
+        }
+
+        // Convert from player's perspective to absolute square
+        int abs_sq = (player == 0) ? action : flip_sq(action);
+
+        // Check if this square has our piece with legal moves
+        if (!is_own_piece(env->board[abs_sq], player)) {
+            env->rewards[player] += env->reward_invalid_piece;
+            env->log.illegal_moves += 1.0f;
+            return 0;
+        }
+
+        // Generate all legal moves and filter for this piece
+        int all_legal[CHESS_MAX_MOVES];
+        int num_legal = generate_legal_moves(env, all_legal, CHESS_MAX_MOVES);
+
+        ps->valid_dest_count = 0;
+        for (int i = 0; i < num_legal; i++) {
+            int from = all_legal[i] / 64;
+            if (from == abs_sq) {
+                ps->valid_dest_moves[ps->valid_dest_count++] = all_legal[i];
+            }
+        }
+
+        if (ps->valid_dest_count == 0) {
+            // Piece has no legal moves
+            env->rewards[player] += env->reward_invalid_piece;
+            env->log.illegal_moves += 1.0f;
+            return 0;
+        }
+
+        // Valid piece selection - transition to phase 1
+        ps->selected_square = abs_sq;
+        ps->pick_phase = 1;
+        env->rewards[player] += env->reward_valid_piece;
+        return 0; // No chess move yet, just phase transition
+
+    } else {
+        // Phase 1: Pick destination or promotion
+        int from_sq = ps->selected_square;
+        int to_sq = -1;
+        int8_t promo_piece = EMPTY;
+
+        if (action >= 0 && action <= 63) {
+            // Destination square - convert from player perspective to absolute
+            to_sq = (player == 0) ? action : flip_sq(action);
+        } else if (action >= 64 && action <= 95) {
+            // Promotion: action = 64 + type*8 + file
+            // type: 0=Queen, 1=Rook, 2=Bishop, 3=Knight
+            int promo_idx = action - 64;
+            int promo_type = promo_idx / 8;  // 0-3
+            int promo_file = promo_idx % 8;  // 0-7
+
+            // The destination row for promotion
+            int promo_row = (player == 0) ? 7 : 0;
+            to_sq = make_sq(promo_row, promo_file);
+
+            // Map promo_type to piece
+            int8_t promo_types_white[4] = {WQ, WR, WB, WN};
+            int8_t promo_types_black[4] = {BQ, BR, BB, BN};
+            promo_piece = (player == 0) ? promo_types_white[promo_type] : promo_types_black[promo_type];
+        } else {
+            // Invalid action range in phase 1
+            ps->pick_phase = 0;
+            ps->selected_square = -1;
+            env->rewards[player] += env->reward_invalid_move;
+            env->log.illegal_moves += 1.0f;
+            return 0;
+        }
+
+        // Check if from_sq -> to_sq is in valid_dest_moves
+        int move_encoded = from_sq * 64 + to_sq;
+        int found = 0;
+        for (int i = 0; i < ps->valid_dest_count; i++) {
+            if (ps->valid_dest_moves[i] == move_encoded) {
+                found = 1;
+                break;
+            }
+        }
+
+        if (!found) {
+            // Invalid destination - reset to phase 0
+            ps->pick_phase = 0;
+            ps->selected_square = -1;
+            env->rewards[player] += env->reward_invalid_move;
+            env->log.illegal_moves += 1.0f;
+            return 0;
+        }
+
+        // Check if this is a promotion move but action was non-promotion (0-63)
+        // In that case, auto-queen (promo_piece stays EMPTY -> apply_move_ex auto-queens)
+        // This allows the simpler destination-only path for promotions too.
+
+        // Valid move - apply it
+        apply_move_ex(env, from_sq, to_sq, promo_piece);
+
+        // Reset phase state
+        ps->pick_phase = 0;
+        ps->selected_square = -1;
+        env->rewards[player] += env->reward_valid_move;
+
+        return 1; // Chess move completed
+    }
+}
+
+// ============================================================================
 // Observation writing
 // ============================================================================
 
-static void fill_action_masks(ChessEnv* env,
-                              unsigned char* white_mask,
-                              unsigned char* black_mask) {
-    /* Default to a single valid noop action for non-turn/terminal rows. */
-    memset(white_mask, 0, CHESS_MASK_SIZE);
-    memset(black_mask, 0, CHESS_MASK_SIZE);
-    white_mask[0] = 1;
-    black_mask[0] = 1;
+// Helper: compute valid_pieces mask for a given player
+// Sets mask[sq]=255 for squares (in player's perspective) that have pieces with legal moves
+static void compute_valid_pieces_mask(ChessEnv* env, int player, unsigned char* mask) {
+    memset(mask, 0, 64);
 
-    if (env->terminals[0]) {
-        return;
-    }
+    if (env->current_player != player) return; // Not our turn
 
-    int legal_moves[CHESS_MAX_MOVES];
-    int num_legal = generate_legal_moves(env, legal_moves, CHESS_MAX_MOVES);
-    if (num_legal <= 0) {
-        return;
-    }
+    int all_legal[CHESS_MAX_MOVES];
+    int num_legal = generate_legal_moves(env, all_legal, CHESS_MAX_MOVES);
 
-    unsigned char* active_mask = (env->current_player == 0) ? white_mask : black_mask;
-    memset(active_mask, 0, CHESS_MASK_SIZE);
+    // Track which from-squares appear in legal moves
+    unsigned char has_legal_from[64];
+    memset(has_legal_from, 0, 64);
     for (int i = 0; i < num_legal; i++) {
-        active_mask[legal_moves[i]] = 1;
+        int from = all_legal[i] / 64;
+        has_legal_from[from] = 1;
+    }
+
+    // Convert to player's perspective
+    for (int sq = 0; sq < 64; sq++) {
+        if (has_legal_from[sq]) {
+            int psq = (player == 0) ? sq : flip_sq(sq);
+            mask[psq] = 255;
+        }
+    }
+}
+
+// Helper: compute valid_dests mask for a player in phase 1
+// Sets mask[sq]=255 for valid destination squares (in player's perspective)
+static void compute_valid_dests_mask(ChessEnv* env, int player, unsigned char* dest_mask, unsigned char* promo_mask) {
+    memset(dest_mask, 0, 64);
+    memset(promo_mask, 0, 32);
+
+    PhaseState* ps = &env->phase_state[player];
+    if (ps->pick_phase != 1) return;
+
+    int from_sq = ps->selected_square;
+
+    for (int i = 0; i < ps->valid_dest_count; i++) {
+        int to = ps->valid_dest_moves[i] % 64;
+        int psq = (player == 0) ? to : flip_sq(to);
+
+        // Check if this is a promotion move
+        if (is_promotion_move(env, from_sq, to)) {
+            // For promotion moves, mark the promotion actions
+            int file = sq_col(to);
+            // Mark all 4 promotion types for this file
+            for (int pt = 0; pt < 4; pt++) {
+                promo_mask[pt * 8 + file] = 255;
+            }
+            // Also mark the destination square (for auto-queen via action 0-63)
+            dest_mask[psq] = 255;
+        } else {
+            dest_mask[psq] = 255;
+        }
     }
 }
 
 static void write_observations(ChessEnv* env) {
     unsigned char* white_obs = env->observations;
     unsigned char* black_obs = env->observations + env->obs_stride;
-    unsigned char* white_mask = white_obs + 64 + CHESS_META_SIZE;
-    unsigned char* black_mask = black_obs + 64 + CHESS_META_SIZE;
+
+    // === Board (offset 0, size 64) ===
 
     // Write board for White (agent 0): as-is
     for (int sq = 0; sq < 64; sq++) {
@@ -764,9 +992,6 @@ static void write_observations(ChessEnv* env) {
     }
 
     // Write board for Black (agent 1): flipped board, swapped colors
-    // Black sees the board from their perspective:
-    // - Row 0 (rank 1) becomes row 7, row 7 becomes row 0
-    // - White pieces (1-6) become 7-12, Black pieces (7-12) become 1-6
     for (int sq = 0; sq < 64; sq++) {
         int r = sq_row(sq);
         int c = sq_col(sq);
@@ -776,46 +1001,86 @@ static void write_observations(ChessEnv* env) {
         if (p == EMPTY) {
             obs_val = 0;
         } else if (is_white_piece(p)) {
-            // White pieces become "opponent" pieces (7-12) for Black
             obs_val = (unsigned char)(p + 6);
         } else {
-            // Black pieces become "own" pieces (1-6) for Black
             obs_val = (unsigned char)(p - 6);
         }
         black_obs[sq] = obs_val;
     }
 
-    // Metadata for White
-    white_obs[64] = (env->current_player == 0) ? 1 : 0;  // is_my_turn
-    white_obs[65] = (env->castling_rights & CASTLE_WK) ? 1 : 0;
-    white_obs[66] = (env->castling_rights & CASTLE_WQ) ? 1 : 0;
-    white_obs[67] = (env->castling_rights & CASTLE_BK) ? 1 : 0;
-    white_obs[68] = (env->castling_rights & CASTLE_BQ) ? 1 : 0;
+    // === Side to move one-hot (offset 64, size 2) ===
+    white_obs[64] = (env->current_player == 0) ? 255 : 0;
+    white_obs[65] = (env->current_player == 0) ? 0 : 255;
+    black_obs[64] = (env->current_player == 1) ? 255 : 0;
+    black_obs[65] = (env->current_player == 1) ? 0 : 255;
+
+    // === Castling rights (offset 66, size 4): own_K, own_Q, opp_K, opp_Q ===
+    white_obs[66] = (env->castling_rights & CASTLE_WK) ? 255 : 0;
+    white_obs[67] = (env->castling_rights & CASTLE_WQ) ? 255 : 0;
+    white_obs[68] = (env->castling_rights & CASTLE_BK) ? 255 : 0;
+    white_obs[69] = (env->castling_rights & CASTLE_BQ) ? 255 : 0;
+
+    black_obs[66] = (env->castling_rights & CASTLE_BK) ? 255 : 0;
+    black_obs[67] = (env->castling_rights & CASTLE_BQ) ? 255 : 0;
+    black_obs[68] = (env->castling_rights & CASTLE_WK) ? 255 : 0;
+    black_obs[69] = (env->castling_rights & CASTLE_WQ) ? 255 : 0;
+
+    // === En passant file (offset 70, size 1) ===
     if (env->en_passant_square >= 0 && env->current_player == 0) {
-        white_obs[69] = (unsigned char)sq_col(env->en_passant_square);
+        white_obs[70] = (unsigned char)sq_col(env->en_passant_square);
     } else {
-        white_obs[69] = 255;
+        white_obs[70] = 255; // None
     }
-    white_obs[70] = (env->halfmove_clock > 255) ? 255 : (unsigned char)env->halfmove_clock;
-    white_obs[71] = (env->fullmove_number > 255) ? 255 : (unsigned char)env->fullmove_number;
-
-    // Metadata for Black (from Black's perspective)
-    black_obs[64] = (env->current_player == 1) ? 1 : 0;  // is_my_turn
-    black_obs[65] = (env->castling_rights & CASTLE_BK) ? 1 : 0;  // own kingside
-    black_obs[66] = (env->castling_rights & CASTLE_BQ) ? 1 : 0;  // own queenside
-    black_obs[67] = (env->castling_rights & CASTLE_WK) ? 1 : 0;  // opponent kingside
-    black_obs[68] = (env->castling_rights & CASTLE_WQ) ? 1 : 0;  // opponent queenside
     if (env->en_passant_square >= 0 && env->current_player == 1) {
-        // Flip the en passant file for Black's perspective
-        // The column stays the same since we only flip rows
-        black_obs[69] = (unsigned char)sq_col(env->en_passant_square);
+        black_obs[70] = (unsigned char)sq_col(env->en_passant_square);
     } else {
-        black_obs[69] = 255;
+        black_obs[70] = 255; // None
     }
-    black_obs[70] = (env->halfmove_clock > 255) ? 255 : (unsigned char)env->halfmove_clock;
-    black_obs[71] = (env->fullmove_number > 255) ? 255 : (unsigned char)env->fullmove_number;
 
-    fill_action_masks(env, white_mask, black_mask);
+    // === Phase one-hot (offset 71, size 2) ===
+    white_obs[71] = (env->phase_state[0].pick_phase == 0) ? 255 : 0;
+    white_obs[72] = (env->phase_state[0].pick_phase == 1) ? 255 : 0;
+    black_obs[71] = (env->phase_state[1].pick_phase == 0) ? 255 : 0;
+    black_obs[72] = (env->phase_state[1].pick_phase == 1) ? 255 : 0;
+
+    // === Selected piece plane (offset 73, size 64) ===
+    memset(white_obs + 73, 0, 64);
+    memset(black_obs + 73, 0, 64);
+    if (env->phase_state[0].pick_phase == 1 && env->phase_state[0].selected_square >= 0) {
+        int psq = env->phase_state[0].selected_square; // White: no flip needed
+        white_obs[73 + psq] = 255;
+    }
+    if (env->phase_state[1].pick_phase == 1 && env->phase_state[1].selected_square >= 0) {
+        int psq = flip_sq(env->phase_state[1].selected_square); // Black: flip
+        black_obs[73 + psq] = 255;
+    }
+
+    // === Valid pieces mask (offset 137, size 64) ===
+    compute_valid_pieces_mask(env, 0, white_obs + 137);
+    compute_valid_pieces_mask(env, 1, black_obs + 137);
+
+    // === Valid destinations mask (offset 201, size 64) + Valid promotions (offset 265, size 32) ===
+    compute_valid_dests_mask(env, 0, white_obs + 201, white_obs + 265);
+    compute_valid_dests_mask(env, 1, black_obs + 201, black_obs + 265);
+
+    // === Self in check (offset 297, size 1) ===
+    white_obs[297] = is_in_check(env, 0) ? 255 : 0;
+    black_obs[297] = is_in_check(env, 1) ? 255 : 0;
+
+    // === Opponent in check (offset 298, size 1) ===
+    white_obs[298] = is_in_check(env, 1) ? 255 : 0;
+    black_obs[298] = is_in_check(env, 0) ? 255 : 0;
+
+    // === Rule50 counter (offset 299, size 1) ===
+    int rule50_scaled = (env->halfmove_clock * 255) / 100;
+    if (rule50_scaled > 255) rule50_scaled = 255;
+    white_obs[299] = (unsigned char)rule50_scaled;
+    black_obs[299] = (unsigned char)rule50_scaled;
+
+    // === Pass valid (offset 300, size 1) ===
+    // Pass is valid when it's NOT this player's turn
+    white_obs[300] = (env->current_player != 0) ? 255 : 0;
+    black_obs[300] = (env->current_player != 1) ? 255 : 0;
 }
 
 // ============================================================================
@@ -864,6 +1129,10 @@ void init(ChessEnv* env) {
     env->max_steps = 256;
     env->illegal_move_penalty = -0.1f;
     env->obs_stride = CHESS_OBS_SIZE;
+    env->reward_invalid_piece = -0.01f;
+    env->reward_invalid_move = -0.01f;
+    env->reward_valid_piece = 0.0f;
+    env->reward_valid_move = 0.0f;
 }
 
 void c_reset(ChessEnv* env) {
@@ -874,6 +1143,14 @@ void c_reset(ChessEnv* env) {
     env->halfmove_clock = 0;
     env->fullmove_number = 1;
     env->step_count = 0;
+
+    // Reset phase state for both players
+    env->phase_state[0].pick_phase = 0;
+    env->phase_state[0].selected_square = -1;
+    env->phase_state[0].valid_dest_count = 0;
+    env->phase_state[1].pick_phase = 0;
+    env->phase_state[1].selected_square = -1;
+    env->phase_state[1].valid_dest_count = 0;
 
     // Clear rewards and terminals for both agents
     env->rewards[0] = 0.0f;
@@ -904,87 +1181,61 @@ void c_step(ChessEnv* env) {
     env->rewards[0] = 0.0f;
     env->rewards[1] = 0.0f;
 
+    // Process both players' actions through the two-phase system
+    int white_action = get_action(env, 0);
+    int black_action = get_action(env, 1);
+
+    // Clamp actions to valid range
+    if (white_action < 0 || white_action >= CHESS_NUM_ACTIONS) white_action = CHESS_PASS_ACTION;
+    if (black_action < 0 || black_action >= CHESS_NUM_ACTIONS) black_action = CHESS_PASS_ACTION;
+
+    // Process current player first, then opponent
     int player = env->current_player;
     int opponent = 1 - player;
 
-    // Read current player's action
-    int action = get_action(env, player);
-    int from_sq = action / 64;
-    int to_sq = action % 64;
+    int player_action = (player == 0) ? white_action : black_action;
+    int opponent_action = (player == 0) ? black_action : white_action;
 
-    // Generate legal moves to validate
-    int legal_moves[CHESS_MAX_MOVES];
-    int num_legal = generate_legal_moves(env, legal_moves, CHESS_MAX_MOVES);
+    // Process current player's action
+    int move_made = process_player_action(env, player_action, player);
 
-    // Check if the action is a legal move
-    int is_legal = 0;
-    int action_encoded = from_sq * 64 + to_sq;
-    for (int i = 0; i < num_legal; i++) {
-        if (legal_moves[i] == action_encoded) {
-            is_legal = 1;
-            break;
-        }
-    }
+    // Process opponent's action (should be PASS if not their turn)
+    process_player_action(env, opponent_action, opponent);
 
     int result = GAME_ONGOING;
 
-    if (!is_legal) {
-        // Illegal move: penalize and pick random legal move
-        env->rewards[player] += env->illegal_move_penalty;
-        env->log.illegal_moves += 1.0f;
+    if (move_made) {
+        // A chess move was completed - switch turn
+        env->current_player = 1 - env->current_player;
 
-        if (num_legal > 0) {
-            int idx = chess_rand_int(&env->rng_state, num_legal);
-            int move = legal_moves[idx];
-            from_sq = move / 64;
-            to_sq = move % 64;
-        } else {
-            // No legal moves (same player, same board) — reuse num_legal=0
-            result = check_game_end(env, 0);
-            goto handle_result;
+        // Check game end
+        result = check_game_end(env, has_any_legal_move(env));
+
+        if (result == GAME_CHECKMATE) {
+            int winner = player;
+            int loser = opponent;
+            env->rewards[winner] += 1.0f;
+            env->rewards[loser] += -1.0f;
+            env->terminals[0] = 1;
+            env->terminals[1] = 1;
+
+            env->log.episode_length = (float)env->step_count;
+            env->log.episode_return = env->rewards[0];
+            if (winner == 0) {
+                env->log.white_wins = 1;
+            } else {
+                env->log.black_wins = 1;
+            }
+            env->log.n = 1;
+        } else if (result == GAME_STALEMATE || result == GAME_FIFTY_MOVE || result == GAME_INSUFFICIENT) {
+            env->terminals[0] = 1;
+            env->terminals[1] = 1;
+
+            env->log.episode_length = (float)env->step_count;
+            env->log.episode_return = env->rewards[0];
+            env->log.draws = 1;
+            env->log.n = 1;
         }
-    }
-
-    // Apply the move
-    apply_move(env, from_sq, to_sq);
-
-    // Switch player
-    env->current_player = 1 - env->current_player;
-
-    // Early-exit check: only need to know IF a legal move exists, not all of them.
-    result = check_game_end(env, has_any_legal_move(env));
-
-handle_result:
-    if (result == GAME_CHECKMATE) {
-        // The current player (after switch) is in checkmate
-        // So the player who just moved wins
-        int winner = player;
-        int loser = opponent;
-        env->rewards[winner] += 1.0f;
-        env->rewards[loser] += -1.0f;
-        env->terminals[0] = 1;
-        env->terminals[1] = 1;
-
-        env->log.episode_length = (float)env->step_count;
-        env->log.episode_return = env->rewards[0]; // White's perspective
-        if (winner == 0) {
-            env->log.white_wins = 1;
-        } else {
-            env->log.black_wins = 1;
-        }
-        env->log.n = 1;
-    } else if (result == GAME_STALEMATE || result == GAME_FIFTY_MOVE || result == GAME_INSUFFICIENT) {
-        // Draw
-        env->terminals[0] = 1;
-        env->terminals[1] = 1;
-
-        env->log.episode_length = (float)env->step_count;
-        env->log.episode_return = env->rewards[0];
-        env->log.draws = 1;
-        env->log.n = 1;
-    } else {
-        // Ongoing: small step penalty to the player who just moved
-        env->rewards[player] -= 0.001f;
     }
 
     // Write observations for both agents

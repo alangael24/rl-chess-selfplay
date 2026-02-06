@@ -69,6 +69,10 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     int max_steps           = (int)unpack_kwarg(kwargs, "max_steps", 256);
     float illegal_penalty   = (float)unpack_kwarg(kwargs, "illegal_move_penalty", -0.1);
     int num_games           = (int)unpack_kwarg(kwargs, "num_games", num_agents / 2);
+    float reward_invalid_piece = (float)unpack_kwarg(kwargs, "reward_invalid_piece", -0.01);
+    float reward_invalid_move  = (float)unpack_kwarg(kwargs, "reward_invalid_move", -0.01);
+    float reward_valid_piece   = (float)unpack_kwarg(kwargs, "reward_valid_piece", 0.0);
+    float reward_valid_move    = (float)unpack_kwarg(kwargs, "reward_valid_move", 0.0);
 
     if (num_agents != num_games * 2) {
         PyErr_SetString(PyExc_ValueError,
@@ -140,6 +144,10 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         init(game);
         game->max_steps = max_steps;
         game->illegal_move_penalty = illegal_penalty;
+        game->reward_invalid_piece = reward_invalid_piece;
+        game->reward_invalid_move = reward_invalid_move;
+        game->reward_valid_piece = reward_valid_piece;
+        game->reward_valid_move = reward_valid_move;
         game->obs_stride = obs_stride_bytes;
     }
 

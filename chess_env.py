@@ -6,6 +6,11 @@ Self-play design:
   - Both agents share the same policy network
   - The C binding pairs consecutive agent slots into shared games
 
+Two-phase action system (97 actions):
+  Phase 0: Pick a piece (action 0-63 = board square)
+  Phase 1: Pick destination (0-63) or promotion (64-95)
+  Action 96: PASS (valid when it's NOT this player's turn)
+
 Follows the patterns from PufferLib Ocean environments (Connect4, Go).
 """
 
@@ -15,13 +20,17 @@ import gymnasium
 import pufferlib
 from csrc import binding
 
-OBS_SIZE = 4168   # 64 board + 8 metadata + 4096 action mask
-NUM_ACTIONS = 4096  # 64 * 64 (from_square * 64 + to_square)
+OBS_SIZE = 301    # 64 board + 2 side + 4 castling + 1 ep + 2 phase + 64 selected
+                  # + 64 valid_pieces + 64 valid_dests + 32 valid_promos
+                  # + 1 self_check + 1 opp_check + 1 rule50 + 1 pass_valid
+NUM_ACTIONS = 97  # 64 squares + 32 promotions + 1 pass
 
 
 class Chess(pufferlib.PufferEnv):
     def __init__(self, num_envs=128, render_mode=None, report_interval=128,
                  max_steps=256, illegal_move_penalty=-0.1,
+                 reward_invalid_piece=-0.01, reward_invalid_move=-0.01,
+                 reward_valid_piece=0.0, reward_valid_move=0.0,
                  buf=None, seed=0):
 
         self.single_observation_space = gymnasium.spaces.Box(
@@ -34,10 +43,6 @@ class Chess(pufferlib.PufferEnv):
 
         super().__init__(buf=buf)
 
-        # The C binding creates num_agents Env structs.
-        # Internally, consecutive pairs (2*i, 2*i+1) share the same ChessGame.
-        # We pass num_agents (not num_envs) so env_binding.h creates the right
-        # number of agent slots, each with its own obs/reward/terminal pointers.
         self.c_envs = binding.vec_init(
             self.observations, self.actions, self.rewards,
             self.terminals, self.truncations,
@@ -45,6 +50,10 @@ class Chess(pufferlib.PufferEnv):
             seed,
             max_steps=max_steps,
             illegal_move_penalty=illegal_move_penalty,
+            reward_invalid_piece=reward_invalid_piece,
+            reward_invalid_move=reward_invalid_move,
+            reward_valid_piece=reward_valid_piece,
+            reward_valid_move=reward_valid_move,
             num_games=num_envs,
         )
 

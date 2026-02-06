@@ -661,17 +661,14 @@ static void apply_move(ChessEnv* env, int from_sq, int to_sq) {
 // Game end detection
 // ============================================================================
 
-static int check_game_end(ChessEnv* env) {
+static int check_game_end(ChessEnv* env, int num_legal) {
     // Fifty-move rule
     if (env->halfmove_clock >= 100) {
         return GAME_FIFTY_MOVE;
     }
 
-    // Check for legal moves
-    int moves[CHESS_MAX_MOVES];
-    int num_moves = generate_legal_moves(env, moves, CHESS_MAX_MOVES);
-
-    if (num_moves == 0) {
+    // num_legal is pre-computed by caller to avoid duplicate generation
+    if (num_legal == 0) {
         if (is_in_check(env, env->current_player)) {
             return GAME_CHECKMATE;
         }
@@ -882,6 +879,8 @@ void c_step(ChessEnv* env) {
         }
     }
 
+    int result = GAME_ONGOING;
+
     if (!is_legal) {
         // Illegal move: penalize and pick random legal move
         env->rewards[player] += env->illegal_move_penalty;
@@ -893,10 +892,9 @@ void c_step(ChessEnv* env) {
             from_sq = move / 64;
             to_sq = move % 64;
         } else {
-            // No legal moves - game should end (checkmate/stalemate)
-            // This will be caught by check_game_end below
-            // Just skip the move application
-            goto check_end;
+            // No legal moves (same player, same board) — reuse num_legal=0
+            result = check_game_end(env, 0);
+            goto handle_result;
         }
     }
 
@@ -906,10 +904,15 @@ void c_step(ChessEnv* env) {
     // Switch player
     env->current_player = 1 - env->current_player;
 
-check_end:;
-    // Check game end
-    int result = check_game_end(env);
+    // Generate legal moves for the new current player ONCE,
+    // then pass to check_game_end to avoid a second generation.
+    {
+        int next_legal[CHESS_MAX_MOVES];
+        int next_num_legal = generate_legal_moves(env, next_legal, CHESS_MAX_MOVES);
+        result = check_game_end(env, next_num_legal);
+    }
 
+handle_result:
     if (result == GAME_CHECKMATE) {
         // The current player (after switch) is in checkmate
         // So the player who just moved wins

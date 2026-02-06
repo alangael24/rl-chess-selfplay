@@ -307,11 +307,12 @@ backend = PufferEnv
 num_envs = 1
 
 [policy]
-hidden_size = 512
-num_blocks = 4
+hidden_size = 256
+num_blocks = 2
 
 [train]
 total_timesteps = 1_000_000_000
+precision = bfloat16
 learning_rate = 2.5e-4
 ent_coef = 0.001
 gamma = 0.99
@@ -319,7 +320,8 @@ gae_lambda = 0.95
 clip_coef = 0.2
 vf_coef = 0.5
 max_grad_norm = 0.5
-update_epochs = 4
+update_epochs = 2
+batch_size = 65536
 minibatch_size = 16384
 bptt_horizon = 16
 checkpoint_interval = 500
@@ -348,7 +350,7 @@ class ChessResidualBlock(nn.Module):
 
 
 class Chess(nn.Module):
-    def __init__(self, env, hidden_size=512, num_blocks=4, **kwargs):
+    def __init__(self, env, hidden_size=256, num_blocks=2, **kwargs):
         super().__init__()
 
         self.piece_embedding = nn.Embedding(CHESS_NUM_PIECE_TYPES, 32)

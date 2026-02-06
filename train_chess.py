@@ -42,7 +42,7 @@ class ResidualBlock(nn.Module):
 
 
 class Policy(nn.Module):
-    def __init__(self, env, hidden_size=512, num_blocks=4):
+    def __init__(self, env, hidden_size=256, num_blocks=2):
         super().__init__()
 
         self.piece_embedding = nn.Embedding(NUM_PIECE_TYPES, 32)
@@ -115,13 +115,13 @@ if __name__ == "__main__":
     args['train']['env'] = 'chess'
     args['train']['total_timesteps'] = 1_000_000_000
     args['train']['torch_deterministic'] = False
-    args['train']['precision'] = 'float32'
+    args['train']['precision'] = 'bfloat16'
     args['train']['learning_rate'] = 2.5e-4
     args['train']['ent_coef'] = 0.001
-    args['train']['batch_size'] = 131072
+    args['train']['batch_size'] = 65536
     args['train']['minibatch_size'] = 16384
     args['train']['bptt_horizon'] = 16
-    args['train']['update_epochs'] = 4
+    args['train']['update_epochs'] = 2
     args['train']['checkpoint_interval'] = 500
     args['train']['gamma'] = 0.99
     args['train']['gae_lambda'] = 0.95
@@ -142,7 +142,7 @@ if __name__ == "__main__":
     )
 
     device = args['train'].get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
-    policy = Policy(vecenv, hidden_size=512, num_blocks=4).to(device)
+    policy = Policy(vecenv, hidden_size=256, num_blocks=2).to(device)
 
     print(f"\n  Params: {sum(p.numel() for p in policy.parameters()):,}")
     print(f"  Device: {device}")

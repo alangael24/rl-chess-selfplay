@@ -67,7 +67,7 @@ class Policy(nn.Module):
         self.critic = pufferlib.pytorch.layer_init(
             nn.Linear(hidden_size, 1), std=1.0)
 
-    def forward(self, x, state=None):
+    def forward_eval(self, x, state=None):
         batch_size = x.shape[0]
         x = x.long()
 
@@ -87,6 +87,9 @@ class Policy(nn.Module):
             x = block(x)
 
         return self.actor(x), self.critic(x)
+
+    def forward(self, x, state=None):
+        return self.forward_eval(x, state)
 
 
 if __name__ == "__main__":

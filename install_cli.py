@@ -313,7 +313,7 @@ num_blocks = 4
 [train]
 total_timesteps = 1_000_000_000
 learning_rate = 2.5e-4
-ent_coef = 0.01
+ent_coef = 0.001
 gamma = 0.99
 gae_lambda = 0.95
 clip_coef = 0.2

@@ -117,7 +117,7 @@ if __name__ == "__main__":
     args['train']['torch_deterministic'] = False
     args['train']['precision'] = 'float32'
     args['train']['learning_rate'] = 2.5e-4
-    args['train']['ent_coef'] = 0.01
+    args['train']['ent_coef'] = 0.001
     args['train']['batch_size'] = 131072
     args['train']['minibatch_size'] = 16384
     args['train']['bptt_horizon'] = 16

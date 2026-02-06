@@ -102,9 +102,15 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     unsigned char* obs_data  = (unsigned char*)PyArray_DATA(observations);
     int obs_stride_bytes     = (int)PyArray_STRIDE(observations, 0); /* bytes per agent obs row */
 
-    /* actions could be int32 or int64 depending on PufferLib version */
+    /* actions must be int32 or int64 */
     void* act_data           = PyArray_DATA(actions);
     int act_itemsize         = (int)PyArray_ITEMSIZE(actions);
+    if ((act_itemsize != 4 && act_itemsize != 8) || !PyArray_ISINTEGER(actions)) {
+        free(vec->games); free(vec);
+        PyErr_SetString(PyExc_TypeError,
+            "actions array must be integer dtype (int32 or int64)");
+        return NULL;
+    }
 
     float* rew_data          = (float*)PyArray_DATA(rewards);
     unsigned char* term_data = (unsigned char*)PyArray_DATA(terminals);

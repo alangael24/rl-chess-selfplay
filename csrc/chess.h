@@ -570,6 +570,21 @@ static int generate_legal_moves(ChessEnv* env, int moves[], int max_moves) {
     return legal_count;
 }
 
+// Early-exit: returns 1 as soon as any legal move is found, 0 if none exist.
+static int has_any_legal_move(ChessEnv* env) {
+    int pseudo_moves[CHESS_MAX_MOVES];
+    int pseudo_count = generate_pseudo_legal_moves(env, pseudo_moves, CHESS_MAX_MOVES);
+
+    for (int i = 0; i < pseudo_count; i++) {
+        int from_sq = pseudo_moves[i] / 64;
+        int to_sq = pseudo_moves[i] % 64;
+        if (is_move_legal(env, from_sq, to_sq)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // ============================================================================
 // Move application
 // ============================================================================
@@ -661,14 +676,14 @@ static void apply_move(ChessEnv* env, int from_sq, int to_sq) {
 // Game end detection
 // ============================================================================
 
-static int check_game_end(ChessEnv* env, int num_legal) {
+static int check_game_end(ChessEnv* env, int has_legal) {
     // Fifty-move rule
     if (env->halfmove_clock >= 100) {
         return GAME_FIFTY_MOVE;
     }
 
-    // num_legal is pre-computed by caller to avoid duplicate generation
-    if (num_legal == 0) {
+    // has_legal: 1 if current player has at least one legal move, 0 if none
+    if (!has_legal) {
         if (is_in_check(env, env->current_player)) {
             return GAME_CHECKMATE;
         }
@@ -904,13 +919,8 @@ void c_step(ChessEnv* env) {
     // Switch player
     env->current_player = 1 - env->current_player;
 
-    // Generate legal moves for the new current player ONCE,
-    // then pass to check_game_end to avoid a second generation.
-    {
-        int next_legal[CHESS_MAX_MOVES];
-        int next_num_legal = generate_legal_moves(env, next_legal, CHESS_MAX_MOVES);
-        result = check_game_end(env, next_num_legal);
-    }
+    // Early-exit check: only need to know IF a legal move exists, not all of them.
+    result = check_game_end(env, has_any_legal_move(env));
 
 handle_result:
     if (result == GAME_CHECKMATE) {

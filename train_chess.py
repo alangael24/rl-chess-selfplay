@@ -26,7 +26,6 @@ import sys
 
 import pufferlib
 import pufferlib.pytorch
-from pufferlib import pufferl
 
 from chess_env import Chess, OBS_SIZE, NUM_ACTIONS
 
@@ -66,6 +65,8 @@ class ResidualBlock(nn.Module):
 class Policy(nn.Module):
     def __init__(self, env, hidden_size=256, num_blocks=2):
         super().__init__()
+        self.hidden_size = hidden_size
+        self.num_lstm_layers = 1
 
         # CNN input: 13 board channels + 3 spatial channels (valid_pieces, valid_dests, selected_piece)
         conv_in = NUM_PIECE_TYPES + 3
@@ -89,6 +90,14 @@ class Policy(nn.Module):
         self.fusion_fc = pufferlib.pytorch.layer_init(
             nn.Linear(hidden_size + 64, hidden_size))
         self.fusion_ln = nn.LayerNorm(hidden_size)
+
+        # LSTM for temporal context across steps
+        self.lstm = nn.LSTM(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=self.num_lstm_layers,
+            batch_first=True,
+        )
 
         self.actor = pufferlib.pytorch.layer_init(
             nn.Linear(hidden_size, NUM_ACTIONS), std=0.01)
@@ -140,6 +149,18 @@ class Policy(nn.Module):
         combined = torch.cat([board_feat, scalar_feat], dim=1)
         feat = F.relu(self.fusion_ln(self.fusion_fc(combined)))
 
+        # LSTM: expects (batch, seq, features)
+        if state is None:
+            h = torch.zeros(self.num_lstm_layers, batch_size, self.hidden_size,
+                            device=x.device, dtype=feat.dtype)
+            c = torch.zeros(self.num_lstm_layers, batch_size, self.hidden_size,
+                            device=x.device, dtype=feat.dtype)
+            state = (h, c)
+
+        feat = feat.unsqueeze(1)  # (batch, 1, hidden)
+        lstm_out, state = self.lstm(feat, state)
+        feat = lstm_out.squeeze(1)  # (batch, hidden)
+
         logits = self.actor(feat)
 
         # Build action mask from observation
@@ -169,7 +190,7 @@ class Policy(nn.Module):
         if all_masked.any():
             masked_logits[all_masked] = logits[all_masked]
 
-        return masked_logits, self.critic(feat)
+        return masked_logits, self.critic(feat), state
 
     def forward(self, x, state=None):
         return self.forward_eval(x, state)
@@ -188,21 +209,24 @@ if __name__ == "__main__":
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
 
+    from pufferlib import pufferl
     args = pufferl.load_config('default')
     args['train']['env'] = 'chess'
     args['train']['total_timesteps'] = 1_000_000_000
     args['train']['torch_deterministic'] = False
     args['train']['precision'] = 'bfloat16'
-    args['train']['learning_rate'] = 2.5e-4
-    args['train']['ent_coef'] = 0.001
-    args['train']['batch_size'] = 65536
-    args['train']['minibatch_size'] = 16384
-    args['train']['bptt_horizon'] = 16
-    args['train']['update_epochs'] = 2
+    args['train']['learning_rate'] = 1e-4
+    args['train']['ent_coef'] = 0.005
+    args['train']['batch_size'] = 131072
+    args['train']['minibatch_size'] = 32768
+    args['train']['bptt_horizon'] = 128
+    args['train']['update_epochs'] = 1
     args['train']['checkpoint_interval'] = 500
-    args['train']['gamma'] = 0.99
+    args['train']['gamma'] = 0.997
     args['train']['gae_lambda'] = 0.95
-    args['train']['clip_coef'] = 0.2
+    args['train']['clip_coef'] = 0.15
+    args['train']['max_grad_norm'] = 1.0
+    args['train']['anneal_lr'] = True
 
     NUM_GAMES = 2048
     NUM_AGENTS = NUM_GAMES * 2

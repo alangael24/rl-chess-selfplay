@@ -77,6 +77,9 @@ typedef struct Log {
     float black_wins;
     float draws;
     float illegal_moves;
+    float material_score;
+    float positional_score;
+    float invalid_action_rate;
     float n;
 } Log;
 
@@ -106,6 +109,7 @@ typedef struct ChessEnv {
     int fullmove_number;
     int step_count;
     int max_steps;
+    float episode_illegal_moves; // per-episode illegal moves counter
     float illegal_move_penalty;
     uint64_t rng_state;
 
@@ -117,6 +121,13 @@ typedef struct ChessEnv {
     float reward_invalid_move;    // default -0.01
     float reward_valid_piece;     // default 0.0
     float reward_valid_move;      // default 0.0
+
+    // Reward shaping config
+    float reward_capture_bonus;   // default 0.0
+    float reward_check_bonus;     // default 0.0
+
+    // FEN curriculum
+    int use_curriculum;
 } ChessEnv;
 
 /* Read action[idx] respecting the actual numpy dtype (int32 or int64). */
@@ -205,6 +216,94 @@ static inline int make_sq(int row, int col) {
 
 static inline int on_board(int row, int col) {
     return row >= 0 && row < 8 && col >= 0 && col < 8;
+}
+
+// ============================================================================
+// Piece values and piece-square tables for reward shaping
+// ============================================================================
+
+// Material values (centipawns): P=100, N=320, B=330, R=500, Q=900, K=0
+static const int PIECE_VALUES[13] = {
+    0,    // EMPTY
+    100,  // WP
+    320,  // WN
+    330,  // WB
+    500,  // WR
+    900,  // WQ
+    0,    // WK
+    100,  // BP
+    320,  // BN
+    330,  // BB
+    500,  // BR
+    900,  // BQ
+    0     // BK
+};
+
+// Pawn piece-square table (from White's perspective, index = square)
+// Rows 0-7 map to ranks 1-8. Encourages center control and advancement.
+static const int PAWN_PST[64] = {
+     0,  0,  0,  0,  0,  0,  0,  0,   // rank 1 (never occupied)
+     5, 10, 10,-20,-20, 10, 10,  5,   // rank 2
+     5, -5,-10,  0,  0,-10, -5,  5,   // rank 3
+     0,  0,  0, 20, 20,  0,  0,  0,   // rank 4
+     5,  5, 10, 25, 25, 10,  5,  5,   // rank 5
+    10, 10, 20, 30, 30, 20, 10, 10,   // rank 6
+    50, 50, 50, 50, 50, 50, 50, 50,   // rank 7
+     0,  0,  0,  0,  0,  0,  0,  0    // rank 8 (promoted)
+};
+
+// Knight piece-square table (from White's perspective)
+static const int KNIGHT_PST[64] = {
+    -50,-40,-30,-30,-30,-30,-40,-50,
+    -40,-20,  0,  5,  5,  0,-20,-40,
+    -30,  5, 10, 15, 15, 10,  5,-30,
+    -30,  0, 15, 20, 20, 15,  0,-30,
+    -30,  5, 15, 20, 20, 15,  5,-30,
+    -30,  0, 10, 15, 15, 10,  0,-30,
+    -40,-20,  0,  0,  0,  0,-20,-40,
+    -50,-40,-30,-30,-30,-30,-40,-50
+};
+
+// Compute material score for a given player (in centipawns)
+static int compute_material_score(ChessEnv* env, int player) {
+    int score = 0;
+    for (int sq = 0; sq < 64; sq++) {
+        int8_t p = env->board[sq];
+        if (p == EMPTY) continue;
+        if (is_own_piece(p, player)) {
+            score += PIECE_VALUES[(int)p];
+        }
+    }
+    return score;
+}
+
+// Compute positional score for a given player using PST (in centipawns)
+static int compute_positional_score(ChessEnv* env, int player) {
+    int score = 0;
+    for (int sq = 0; sq < 64; sq++) {
+        int8_t p = env->board[sq];
+        if (p == EMPTY) continue;
+        if (!is_own_piece(p, player)) continue;
+
+        int ptype = p;
+        if (ptype >= BP) ptype -= 6;
+
+        // For Black, mirror the square vertically to use White-perspective tables
+        int pst_sq = (player == 0) ? sq : make_sq(7 - sq_row(sq), sq_col(sq));
+
+        switch (ptype) {
+        case WP: score += PAWN_PST[pst_sq]; break;
+        case WN: score += KNIGHT_PST[pst_sq]; break;
+        default: break;
+        }
+    }
+    return score;
+}
+
+// Get the value of a captured piece (returns 0 if EMPTY)
+static inline int captured_piece_value(int8_t piece) {
+    if (piece == EMPTY) return 0;
+    return PIECE_VALUES[(int)piece];
 }
 
 // ============================================================================
@@ -796,14 +895,14 @@ static int process_player_action(ChessEnv* env, int action, int player) {
         }
         // Invalid pass (it IS our turn) - penalize
         env->rewards[player] += env->reward_invalid_move;
-        env->log.illegal_moves += 1.0f;
+        env->episode_illegal_moves += 1.0f;
         return 0;
     }
 
     // If it's not our turn, any non-pass action is invalid
     if (env->current_player != player) {
         env->rewards[player] += env->reward_invalid_move;
-        env->log.illegal_moves += 1.0f;
+        env->episode_illegal_moves += 1.0f;
         return 0;
     }
 
@@ -811,7 +910,7 @@ static int process_player_action(ChessEnv* env, int action, int player) {
         // Phase 0: Pick a piece
         if (action < 0 || action > 63) {
             env->rewards[player] += env->reward_invalid_piece;
-            env->log.illegal_moves += 1.0f;
+            env->episode_illegal_moves += 1.0f;
             return 0;
         }
 
@@ -821,7 +920,7 @@ static int process_player_action(ChessEnv* env, int action, int player) {
         // Check if this square has our piece with legal moves
         if (!is_own_piece(env->board[abs_sq], player)) {
             env->rewards[player] += env->reward_invalid_piece;
-            env->log.illegal_moves += 1.0f;
+            env->episode_illegal_moves += 1.0f;
             return 0;
         }
 
@@ -840,7 +939,7 @@ static int process_player_action(ChessEnv* env, int action, int player) {
         if (ps->valid_dest_count == 0) {
             // Piece has no legal moves
             env->rewards[player] += env->reward_invalid_piece;
-            env->log.illegal_moves += 1.0f;
+            env->episode_illegal_moves += 1.0f;
             return 0;
         }
 
@@ -879,7 +978,7 @@ static int process_player_action(ChessEnv* env, int action, int player) {
             ps->pick_phase = 0;
             ps->selected_square = -1;
             env->rewards[player] += env->reward_invalid_move;
-            env->log.illegal_moves += 1.0f;
+            env->episode_illegal_moves += 1.0f;
             return 0;
         }
 
@@ -898,13 +997,24 @@ static int process_player_action(ChessEnv* env, int action, int player) {
             ps->pick_phase = 0;
             ps->selected_square = -1;
             env->rewards[player] += env->reward_invalid_move;
-            env->log.illegal_moves += 1.0f;
+            env->episode_illegal_moves += 1.0f;
             return 0;
         }
 
         // Check if this is a promotion move but action was non-promotion (0-63)
         // In that case, auto-queen (promo_piece stays EMPTY -> apply_move_ex auto-queens)
         // This allows the simpler destination-only path for promotions too.
+
+        // Capture bonus: check what's on destination before applying
+        int8_t cap_piece = env->board[to_sq];
+        // Also check en passant capture
+        int8_t moving = env->board[from_sq];
+        int mtype = moving;
+        if (mtype >= BP) mtype -= 6;
+        if (mtype == WP && to_sq == env->en_passant_square) {
+            // En passant captures a pawn
+            cap_piece = (player == 0) ? BP : WP;
+        }
 
         // Valid move - apply it
         apply_move_ex(env, from_sq, to_sq, promo_piece);
@@ -913,6 +1023,20 @@ static int process_player_action(ChessEnv* env, int action, int player) {
         ps->pick_phase = 0;
         ps->selected_square = -1;
         env->rewards[player] += env->reward_valid_move;
+
+        // Capture bonus (scaled by captured piece value / 900)
+        if (cap_piece != EMPTY && env->reward_capture_bonus != 0.0f) {
+            int cap_val = captured_piece_value(cap_piece);
+            env->rewards[player] += env->reward_capture_bonus * (float)cap_val / 900.0f;
+        }
+
+        // Check bonus: if move gives check to opponent
+        if (env->reward_check_bonus != 0.0f) {
+            int opp = 1 - player;
+            if (is_in_check(env, opp)) {
+                env->rewards[player] += env->reward_check_bonus;
+            }
+        }
 
         return 1; // Chess move completed
     }
@@ -1122,6 +1246,132 @@ static void setup_initial_board(ChessEnv* env) {
 }
 
 // ============================================================================
+// FEN parser
+// ============================================================================
+
+// Parse a FEN string and set up the board position.
+// Returns 1 on success, 0 on failure.
+static int setup_from_fen(ChessEnv* env, const char* fen) {
+    if (!fen || !*fen) return 0;
+
+    memset(env->board, EMPTY, 64);
+
+    // Part 1: piece placement (ranks 8 to 1 = rows 7 to 0)
+    int row = 7;
+    int col = 0;
+    const char* p = fen;
+
+    while (*p && *p != ' ') {
+        if (*p == '/') {
+            row--;
+            col = 0;
+            if (row < 0) return 0;
+        } else if (*p >= '1' && *p <= '8') {
+            col += (*p - '0');
+        } else {
+            if (row < 0 || row > 7 || col < 0 || col > 7) return 0;
+            int sq = make_sq(row, col);
+            switch (*p) {
+                case 'P': env->board[sq] = WP; break;
+                case 'N': env->board[sq] = WN; break;
+                case 'B': env->board[sq] = WB; break;
+                case 'R': env->board[sq] = WR; break;
+                case 'Q': env->board[sq] = WQ; break;
+                case 'K': env->board[sq] = WK; break;
+                case 'p': env->board[sq] = BP; break;
+                case 'n': env->board[sq] = BN; break;
+                case 'b': env->board[sq] = BB; break;
+                case 'r': env->board[sq] = BR; break;
+                case 'q': env->board[sq] = BQ; break;
+                case 'k': env->board[sq] = BK; break;
+                default: return 0;
+            }
+            col++;
+        }
+        p++;
+    }
+
+    // Skip space
+    if (*p != ' ') return 0;
+    p++;
+
+    // Part 2: active color
+    if (*p == 'w') {
+        env->current_player = 0;
+    } else if (*p == 'b') {
+        env->current_player = 1;
+    } else {
+        return 0;
+    }
+    p++;
+
+    // Skip space
+    if (*p != ' ') return 0;
+    p++;
+
+    // Part 3: castling availability
+    env->castling_rights = 0;
+    if (*p == '-') {
+        p++;
+    } else {
+        while (*p && *p != ' ') {
+            switch (*p) {
+                case 'K': env->castling_rights |= CASTLE_WK; break;
+                case 'Q': env->castling_rights |= CASTLE_WQ; break;
+                case 'k': env->castling_rights |= CASTLE_BK; break;
+                case 'q': env->castling_rights |= CASTLE_BQ; break;
+                default: break;
+            }
+            p++;
+        }
+    }
+
+    // Skip space
+    if (*p != ' ') return 0;
+    p++;
+
+    // Part 4: en passant target square
+    env->en_passant_square = -1;
+    if (*p == '-') {
+        p++;
+    } else {
+        if (*p >= 'a' && *p <= 'h' && *(p + 1) >= '1' && *(p + 1) <= '8') {
+            int file = *p - 'a';
+            int rank = *(p + 1) - '1';
+            env->en_passant_square = make_sq(rank, file);
+            p += 2;
+        } else {
+            return 0;
+        }
+    }
+
+    // Part 5: halfmove clock (optional)
+    env->halfmove_clock = 0;
+    if (*p == ' ') {
+        p++;
+        env->halfmove_clock = 0;
+        while (*p >= '0' && *p <= '9') {
+            env->halfmove_clock = env->halfmove_clock * 10 + (*p - '0');
+            p++;
+        }
+    }
+
+    // Part 6: fullmove number (optional)
+    env->fullmove_number = 1;
+    if (*p == ' ') {
+        p++;
+        env->fullmove_number = 0;
+        while (*p >= '0' && *p <= '9') {
+            env->fullmove_number = env->fullmove_number * 10 + (*p - '0');
+            p++;
+        }
+        if (env->fullmove_number == 0) env->fullmove_number = 1;
+    }
+
+    return 1;
+}
+
+// ============================================================================
 // PufferLib interface functions
 // ============================================================================
 
@@ -1133,6 +1383,9 @@ void init(ChessEnv* env) {
     env->reward_invalid_move = -0.01f;
     env->reward_valid_piece = 0.0f;
     env->reward_valid_move = 0.0f;
+    env->reward_capture_bonus = 0.0f;
+    env->reward_check_bonus = 0.0f;
+    env->use_curriculum = 0;
 }
 
 void c_reset(ChessEnv* env) {
@@ -1158,14 +1411,8 @@ void c_reset(ChessEnv* env) {
     env->terminals[0] = 0;
     env->terminals[1] = 0;
 
-    // Reset log
-    env->log.episode_length = 0;
-    env->log.episode_return = 0;
-    env->log.white_wins = 0;
-    env->log.black_wins = 0;
-    env->log.draws = 0;
-    env->log.illegal_moves = 0;
-    env->log.n = 0;
+    // Reset per-episode counter (log accumulates across episodes)
+    env->episode_illegal_moves = 0.0f;
 
     write_observations(env);
 }
@@ -1219,22 +1466,30 @@ void c_step(ChessEnv* env) {
             env->terminals[0] = 1;
             env->terminals[1] = 1;
 
-            env->log.episode_length = (float)env->step_count;
-            env->log.episode_return = env->rewards[0];
+            env->log.episode_length += (float)env->step_count;
+            env->log.episode_return += env->rewards[0];
             if (winner == 0) {
-                env->log.white_wins = 1;
+                env->log.white_wins += 1;
             } else {
-                env->log.black_wins = 1;
+                env->log.black_wins += 1;
             }
-            env->log.n = 1;
+            env->log.illegal_moves += env->episode_illegal_moves;
+            env->log.material_score += (float)(compute_material_score(env, 0) - compute_material_score(env, 1));
+            env->log.positional_score += (float)(compute_positional_score(env, 0) - compute_positional_score(env, 1));
+            env->log.invalid_action_rate += (env->step_count > 0) ? env->episode_illegal_moves / (float)env->step_count : 0.0f;
+            env->log.n += 1;
         } else if (result == GAME_STALEMATE || result == GAME_FIFTY_MOVE || result == GAME_INSUFFICIENT) {
             env->terminals[0] = 1;
             env->terminals[1] = 1;
 
-            env->log.episode_length = (float)env->step_count;
-            env->log.episode_return = env->rewards[0];
-            env->log.draws = 1;
-            env->log.n = 1;
+            env->log.episode_length += (float)env->step_count;
+            env->log.episode_return += env->rewards[0];
+            env->log.draws += 1;
+            env->log.illegal_moves += env->episode_illegal_moves;
+            env->log.material_score += (float)(compute_material_score(env, 0) - compute_material_score(env, 1));
+            env->log.positional_score += (float)(compute_positional_score(env, 0) - compute_positional_score(env, 1));
+            env->log.invalid_action_rate += (env->step_count > 0) ? env->episode_illegal_moves / (float)env->step_count : 0.0f;
+            env->log.n += 1;
         }
     }
 
@@ -1247,10 +1502,14 @@ void c_step(ChessEnv* env) {
         env->terminals[0] = 1;
         env->terminals[1] = 1;
 
-        env->log.episode_length = (float)env->step_count;
-        env->log.episode_return = env->rewards[0];
-        env->log.draws = 1;
-        env->log.n = 1;
+        env->log.episode_length += (float)env->step_count;
+        env->log.episode_return += env->rewards[0];
+        env->log.draws += 1;
+        env->log.illegal_moves += env->episode_illegal_moves;
+        env->log.material_score += (float)(compute_material_score(env, 0) - compute_material_score(env, 1));
+        env->log.positional_score += (float)(compute_positional_score(env, 0) - compute_positional_score(env, 1));
+        env->log.invalid_action_rate += (env->step_count > 0) ? env->episode_illegal_moves / (float)env->step_count : 0.0f;
+        env->log.n += 1;
     }
 }
 

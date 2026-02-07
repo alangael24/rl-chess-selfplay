@@ -31,6 +31,8 @@ class Chess(pufferlib.PufferEnv):
                  max_steps=256, illegal_move_penalty=-0.1,
                  reward_invalid_piece=-0.01, reward_invalid_move=-0.01,
                  reward_valid_piece=0.0, reward_valid_move=0.0,
+                 reward_capture_bonus=0.0, reward_check_bonus=0.0,
+                 fen_file=None, fen_curric_pct=0.0,
                  buf=None, seed=0):
 
         self.single_observation_space = gymnasium.spaces.Box(
@@ -43,18 +45,27 @@ class Chess(pufferlib.PufferEnv):
 
         super().__init__(buf=buf)
 
-        self.c_envs = binding.vec_init(
-            self.observations, self.actions, self.rewards,
-            self.terminals, self.truncations,
-            self.num_agents,  # number of agent slots
-            seed,
+        init_kwargs = dict(
             max_steps=max_steps,
             illegal_move_penalty=illegal_move_penalty,
             reward_invalid_piece=reward_invalid_piece,
             reward_invalid_move=reward_invalid_move,
             reward_valid_piece=reward_valid_piece,
             reward_valid_move=reward_valid_move,
+            reward_capture_bonus=reward_capture_bonus,
+            reward_check_bonus=reward_check_bonus,
+            fen_curric_pct=fen_curric_pct,
             num_games=num_envs,
+        )
+        if fen_file is not None:
+            init_kwargs['fen_file'] = fen_file
+
+        self.c_envs = binding.vec_init(
+            self.observations, self.actions, self.rewards,
+            self.terminals, self.truncations,
+            self.num_agents,  # number of agent slots
+            seed,
+            **init_kwargs,
         )
 
     def reset(self, seed=None):

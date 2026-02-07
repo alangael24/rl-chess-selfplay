@@ -247,6 +247,8 @@ class Chess(pufferlib.PufferEnv):
                  max_steps=256, illegal_move_penalty=-0.1,
                  reward_invalid_piece=-0.01, reward_invalid_move=-0.01,
                  reward_valid_piece=0.0, reward_valid_move=0.0,
+                 reward_capture_bonus=0.0, reward_check_bonus=0.0,
+                 fen_file=None, fen_curric_pct=0.0,
                  buf=None, seed=0):
 
         self.single_observation_space = gymnasium.spaces.Box(
@@ -258,17 +260,26 @@ class Chess(pufferlib.PufferEnv):
 
         super().__init__(buf=buf)
 
-        self.c_envs = binding.vec_init(
-            self.observations, self.actions, self.rewards,
-            self.terminals, self.truncations,
-            self.num_agents, seed,
+        init_kwargs = dict(
             max_steps=max_steps,
             illegal_move_penalty=illegal_move_penalty,
             reward_invalid_piece=reward_invalid_piece,
             reward_invalid_move=reward_invalid_move,
             reward_valid_piece=reward_valid_piece,
             reward_valid_move=reward_valid_move,
+            reward_capture_bonus=reward_capture_bonus,
+            reward_check_bonus=reward_check_bonus,
+            fen_curric_pct=fen_curric_pct,
             num_games=num_envs,
+        )
+        if fen_file is not None:
+            init_kwargs['fen_file'] = fen_file
+
+        self.c_envs = binding.vec_init(
+            self.observations, self.actions, self.rewards,
+            self.terminals, self.truncations,
+            self.num_agents, seed,
+            **init_kwargs,
         )
 
     def reset(self, seed=None):
@@ -313,6 +324,9 @@ reward_invalid_piece = -0.01
 reward_invalid_move = -0.01
 reward_valid_piece = 0.0
 reward_valid_move = 0.0
+reward_capture_bonus = 0.0
+reward_check_bonus = 0.0
+fen_curric_pct = 0.0
 report_interval = 128
 
 [vec]
@@ -326,18 +340,19 @@ num_blocks = 2
 [train]
 total_timesteps = 1_000_000_000
 precision = bfloat16
-learning_rate = 2.5e-4
-ent_coef = 0.001
-gamma = 0.99
+learning_rate = 1e-4
+ent_coef = 0.005
+gamma = 0.997
 gae_lambda = 0.95
-clip_coef = 0.2
+clip_coef = 0.15
 vf_coef = 0.5
-max_grad_norm = 0.5
-update_epochs = 2
-batch_size = 65536
-minibatch_size = 16384
-bptt_horizon = 16
+max_grad_norm = 1.0
+update_epochs = 1
+batch_size = 131072
+minibatch_size = 32768
+bptt_horizon = 128
 checkpoint_interval = 500
+anneal_lr = True
 '''
 
 # --- Policy class (appended to ocean/torch.py) ---
@@ -382,6 +397,8 @@ class ChessResidualBlock(nn.Module):
 class Chess(nn.Module):
     def __init__(self, env, hidden_size=256, num_blocks=2, **kwargs):
         super().__init__()
+        self.hidden_size = hidden_size
+        self.num_lstm_layers = 1
 
         conv_in = CHESS_NUM_PIECE_TYPES + 3  # board + valid_pieces + valid_dests + selected
         conv_channels = 64
@@ -404,6 +421,14 @@ class Chess(nn.Module):
         self.fusion_fc = pufferlib.pytorch.layer_init(
             nn.Linear(hidden_size + 64, hidden_size))
         self.fusion_ln = nn.LayerNorm(hidden_size)
+
+        # LSTM for temporal context across steps
+        self.lstm = nn.LSTM(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=self.num_lstm_layers,
+            batch_first=True,
+        )
 
         self.actor = pufferlib.pytorch.layer_init(
             nn.Linear(hidden_size, CHESS_NUM_ACTIONS), std=0.01)
@@ -454,6 +479,18 @@ class Chess(nn.Module):
         combined = torch.cat([board_feat, scalar_feat], dim=1)
         feat = F.relu(self.fusion_ln(self.fusion_fc(combined)))
 
+        # LSTM: expects (batch, seq, features)
+        if state is None:
+            h = torch.zeros(self.num_lstm_layers, batch_size, self.hidden_size,
+                            device=x.device, dtype=feat.dtype)
+            c = torch.zeros(self.num_lstm_layers, batch_size, self.hidden_size,
+                            device=x.device, dtype=feat.dtype)
+            state = (h, c)
+
+        feat = feat.unsqueeze(1)  # (batch, 1, hidden)
+        lstm_out, state = self.lstm(feat, state)
+        feat = lstm_out.squeeze(1)  # (batch, hidden)
+
         logits = self.actor(feat)
 
         # Build action mask
@@ -473,7 +510,7 @@ class Chess(nn.Module):
         if all_masked.any():
             masked_logits[all_masked] = logits[all_masked]
 
-        return masked_logits, self.critic(feat)
+        return masked_logits, self.critic(feat), state
 
     def forward(self, x, state=None):
         return self.forward_eval(x, state)

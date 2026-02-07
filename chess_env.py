@@ -34,6 +34,9 @@ class Chess(pufferlib.PufferEnv):
                  reward_capture_bonus=0.0, reward_check_bonus=0.0,
                  reward_repetition=0.0, reward_material=0.0,
                  reward_position=0.0, reward_castling=0.0,
+                 reward_draw=0.0, reward_see_hanging=0.0,
+                 enable_50_move_rule=1,
+                 enable_threefold_repetition=1,
                  fen_file=None, fen_curric_pct=0.0,
                  buf=None, seed=0):
 
@@ -60,6 +63,10 @@ class Chess(pufferlib.PufferEnv):
             reward_material=reward_material,
             reward_position=reward_position,
             reward_castling=reward_castling,
+            reward_draw=reward_draw,
+            reward_see_hanging=reward_see_hanging,
+            enable_50_move_rule=enable_50_move_rule,
+            enable_threefold_repetition=enable_threefold_repetition,
             fen_curric_pct=fen_curric_pct,
             num_games=num_envs,
         )

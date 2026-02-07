@@ -132,6 +132,9 @@ typedef struct ChessEnv {
     float reward_material;        // default 0.0 - scale for material delta per move
     float reward_position;        // default 0.0 - scale for positional delta per move
     float reward_castling;        // default 0.0 - one-time castling bonus
+    float reward_draw;            // default 0.0 - reward for draw outcomes
+    int enable_50_move_rule;      // 1=enabled, 0=disabled (default 1)
+    int enable_threefold_repetition; // 1=enabled, 0=disabled (default 1)
 
     // Position history for threefold repetition
     uint64_t position_history[512];
@@ -142,6 +145,16 @@ typedef struct ChessEnv {
 
     // FEN curriculum
     int use_curriculum;
+
+    // SEE/hanging reward shaping
+    float reward_see_hanging;         // default 0.0 - penalty for hanging pieces
+    int last_see_value;               // SEE value of last move (for diagnostics)
+
+    // Legal move cache
+    int legal_moves_cache[256];       // cached legal moves array
+    int legal_moves_cache_count;      // -1 = invalid
+    uint64_t legal_moves_key;         // position hash when cached
+    int legal_moves_side;             // current_player when cached
 } ChessEnv;
 
 /* Read action[idx] respecting the actual numpy dtype (int32 or int64). */
@@ -318,6 +331,236 @@ static int compute_positional_score(ChessEnv* env, int player) {
 static inline int captured_piece_value(int8_t piece) {
     if (piece == EMPTY) return 0;
     return PIECE_VALUES[(int)piece];
+}
+
+// Forward declaration for SEE
+static inline int is_square_attacked(ChessEnv* env, int sq, int by_player);
+
+// ============================================================================
+// Static Exchange Evaluation (SEE)
+// ============================================================================
+
+// SEE piece values: indexed by piece code (0-12)
+// Using standard centipawn values: P=100, N=320, B=330, R=500, Q=900, K=20000
+static const int SEE_PIECE_VALUES[13] = {
+    0,      // EMPTY
+    100,    // WP
+    320,    // WN
+    330,    // WB
+    500,    // WR
+    900,    // WQ
+    20000,  // WK
+    100,    // BP
+    320,    // BN
+    330,    // BB
+    500,    // BR
+    900,    // BQ
+    20000   // BK
+};
+
+// Find all pieces of `by_player` attacking `sq`, respecting occupied[] mask.
+// Fills atk_pieces[] with piece codes and atk_squares[] with source squares.
+// occupied[sq]=0 means that square is "removed" (piece captured/used in exchange).
+static int find_attackers_to_sq_occ(ChessEnv* env, int sq, int by_player,
+                                     int8_t atk_pieces[], int atk_squares[],
+                                     int max_attackers, const int occupied[64]) {
+    int count = 0;
+    int r = sq_row(sq);
+    int c = sq_col(sq);
+
+    // Pawn attacks
+    if (by_player == 0) {
+        if (r > 0) {
+            int s;
+            if (c > 0) { s = make_sq(r - 1, c - 1); if (occupied[s] && env->board[s] == WP && count < max_attackers) { atk_pieces[count] = WP; atk_squares[count] = s; count++; } }
+            if (c < 7) { s = make_sq(r - 1, c + 1); if (occupied[s] && env->board[s] == WP && count < max_attackers) { atk_pieces[count] = WP; atk_squares[count] = s; count++; } }
+        }
+    } else {
+        if (r < 7) {
+            int s;
+            if (c > 0) { s = make_sq(r + 1, c - 1); if (occupied[s] && env->board[s] == BP && count < max_attackers) { atk_pieces[count] = BP; atk_squares[count] = s; count++; } }
+            if (c < 7) { s = make_sq(r + 1, c + 1); if (occupied[s] && env->board[s] == BP && count < max_attackers) { atk_pieces[count] = BP; atk_squares[count] = s; count++; } }
+        }
+    }
+
+    // Knight attacks
+    int8_t knight = (by_player == 0) ? WN : BN;
+    for (int i = 0; i < 8; i++) {
+        int nr = r + KNIGHT_OFFSETS[i][0];
+        int nc = c + KNIGHT_OFFSETS[i][1];
+        if (on_board(nr, nc)) {
+            int s = make_sq(nr, nc);
+            if (occupied[s] && env->board[s] == knight && count < max_attackers) {
+                atk_pieces[count] = knight; atk_squares[count] = s; count++;
+            }
+        }
+    }
+
+    // Bishop/Queen diagonal attacks (respects occupied for x-ray)
+    int8_t bishop = (by_player == 0) ? WB : BB;
+    int8_t queen = (by_player == 0) ? WQ : BQ;
+    for (int d = 0; d < 4; d++) {
+        int dr = BISHOP_DIRS[d][0];
+        int dc = BISHOP_DIRS[d][1];
+        int nr = r + dr;
+        int nc = c + dc;
+        while (on_board(nr, nc)) {
+            int s = make_sq(nr, nc);
+            if (occupied[s]) {
+                int8_t p = env->board[s];
+                if ((p == bishop || p == queen) && count < max_attackers) {
+                    atk_pieces[count] = p; atk_squares[count] = s; count++;
+                }
+                break; // blocked by occupied piece
+            }
+            // occupied[s]==0: piece removed, keep scanning (x-ray)
+            nr += dr;
+            nc += dc;
+        }
+    }
+
+    // Rook/Queen straight attacks (respects occupied for x-ray)
+    int8_t rook = (by_player == 0) ? WR : BR;
+    for (int d = 0; d < 4; d++) {
+        int dr = ROOK_DIRS[d][0];
+        int dc = ROOK_DIRS[d][1];
+        int nr = r + dr;
+        int nc = c + dc;
+        while (on_board(nr, nc)) {
+            int s = make_sq(nr, nc);
+            if (occupied[s]) {
+                int8_t p = env->board[s];
+                if ((p == rook || p == queen) && count < max_attackers) {
+                    atk_pieces[count] = p; atk_squares[count] = s; count++;
+                }
+                break;
+            }
+            nr += dr;
+            nc += dc;
+        }
+    }
+
+    // King attacks
+    int8_t king = (by_player == 0) ? WK : BK;
+    for (int i = 0; i < 8; i++) {
+        int nr = r + KING_OFFSETS[i][0];
+        int nc = c + KING_OFFSETS[i][1];
+        if (on_board(nr, nc)) {
+            int s = make_sq(nr, nc);
+            if (occupied[s] && env->board[s] == king && count < max_attackers) {
+                atk_pieces[count] = king; atk_squares[count] = s; count++;
+            }
+        }
+    }
+
+    return count;
+}
+
+// Find index of least valuable attacker in the array
+static int find_least_valuable_attacker(int8_t attackers[], int count) {
+    if (count == 0) return -1;
+    int best = 0;
+    int best_val = SEE_PIECE_VALUES[(int)attackers[0]];
+    for (int i = 1; i < count; i++) {
+        int val = SEE_PIECE_VALUES[(int)attackers[i]];
+        if (val < best_val) {
+            best_val = val;
+            best = i;
+        }
+    }
+    return best;
+}
+
+// Full SEE for a capture: moving_piece on from_sq captures target_piece on to_sq.
+// Tracks attacker consumption and reveals x-ray attackers behind removed pieces.
+static int see_capture(ChessEnv* env, int from_sq, int to_sq, int8_t moving_piece, int8_t target_piece, int player) {
+    int gain[32];
+    int depth = 0;
+    int side = player;
+
+    // Occupancy mask: 1=present, 0=removed during exchange
+    int occupied[64];
+    for (int i = 0; i < 64; i++) occupied[i] = (env->board[i] != EMPTY);
+
+    // Remove the initial attacker from its source square
+    occupied[from_sq] = 0;
+
+    // Initial capture gain
+    gain[depth] = SEE_PIECE_VALUES[(int)target_piece];
+
+    // The piece currently "on" the square (just captured onto it)
+    int8_t current_piece = moving_piece;
+
+    // Alternating captures with attacker consumption
+    for (depth = 1; depth < 32; depth++) {
+        side = 1 - side;
+        gain[depth] = SEE_PIECE_VALUES[(int)current_piece] - gain[depth - 1];
+
+        // Pruning: if both sides are losing, stop
+        if (gain[depth] < 0 && gain[depth - 1] < 0) break;
+
+        // Find attackers with updated occupancy (reveals x-ray pieces)
+        int8_t atk_pieces[32];
+        int atk_sqs[32];
+        int atk_count = find_attackers_to_sq_occ(env, to_sq, side,
+                                                  atk_pieces, atk_sqs, 32, occupied);
+        if (atk_count == 0) break;
+
+        // Pick least valuable attacker
+        int lva = find_least_valuable_attacker(atk_pieces, atk_count);
+        current_piece = atk_pieces[lva];
+
+        // Remove this attacker from occupancy (consumed in exchange)
+        occupied[atk_sqs[lva]] = 0;
+    }
+
+    // Minimax the gain array from the end
+    for (int d = depth - 1; d > 0; d--) {
+        if (-gain[d] < gain[d - 1])
+            gain[d - 1] = -gain[d];
+    }
+
+    return gain[0];
+}
+
+// SEE for a quiet move to a square (piece moves from from_sq to to_sq which is empty).
+// Checks if the square is attacked by opponent and evaluates the exchange.
+// Returns negative if moving to an attacked square is losing.
+static int see_square(ChessEnv* env, int from_sq, int to_sq, int8_t moving_piece, int player) {
+    int opponent = 1 - player;
+
+    // Check if opponent attacks this square
+    if (!is_square_attacked(env, to_sq, opponent)) {
+        return 0; // Safe square
+    }
+
+    // Simulate piece being on to_sq: run SEE as if opponent captures it.
+    // Occupancy: remove from_sq, add to_sq (piece has moved)
+    int occupied[64];
+    for (int i = 0; i < 64; i++) occupied[i] = (env->board[i] != EMPTY);
+    occupied[from_sq] = 0;
+    occupied[to_sq] = 1; // piece is now here
+
+    // Find opponent's attackers with updated occupancy
+    int8_t atk_pieces[32];
+    int atk_sqs[32];
+    int atk_count = find_attackers_to_sq_occ(env, to_sq, opponent,
+                                              atk_pieces, atk_sqs, 32, occupied);
+    if (atk_count == 0) return 0;
+
+    // Opponent captures our piece with their LVA
+    int lva = find_least_valuable_attacker(atk_pieces, atk_count);
+    int8_t opp_attacker = atk_pieces[lva];
+    int opp_from = atk_sqs[lva];
+
+    // Run full SEE from opponent's perspective
+    int opp_see = see_capture(env, opp_from, to_sq, opp_attacker, moving_piece, opponent);
+
+    // If opponent gains from capturing our piece, we lose
+    if (opp_see > 0) {
+        return -opp_see;
+    }
+    return 0;
 }
 
 // ============================================================================
@@ -752,8 +995,46 @@ static int generate_legal_moves(ChessEnv* env, int moves[], int max_moves) {
     return legal_count;
 }
 
+// Generate legal moves with caching: checks hash+side match, returns cached on hit,
+// generates+stores on miss. Writes into the provided moves[] buffer.
+static int generate_legal_moves_cached(ChessEnv* env, int moves[], int max_moves) {
+    uint64_t key = compute_position_hash(env);
+    int side = env->current_player;
+
+    // Cache hit: same position hash and same side to move
+    if (env->legal_moves_cache_count >= 0 &&
+        env->legal_moves_key == key &&
+        env->legal_moves_side == side) {
+        int count = env->legal_moves_cache_count;
+        if (count > max_moves) count = max_moves;
+        memcpy(moves, env->legal_moves_cache, count * sizeof(int));
+        return count;
+    }
+
+    // Cache miss: generate and store
+    int count = generate_legal_moves(env, env->legal_moves_cache, CHESS_MAX_MOVES);
+    env->legal_moves_cache_count = count;
+    env->legal_moves_key = key;
+    env->legal_moves_side = side;
+
+    int ret = count;
+    if (ret > max_moves) ret = max_moves;
+    memcpy(moves, env->legal_moves_cache, ret * sizeof(int));
+    return ret;
+}
+
 // Early-exit: returns 1 as soon as any legal move is found, 0 if none exist.
+// Uses legal move cache if valid, otherwise falls back to pseudo-legal scan.
 static int has_any_legal_move(ChessEnv* env) {
+    // Check cache first
+    uint64_t key = compute_position_hash(env);
+    int side = env->current_player;
+    if (key == env->legal_moves_key && side == env->legal_moves_side &&
+        env->legal_moves_cache_count >= 0) {
+        return env->legal_moves_cache_count > 0;
+    }
+
+    // Cache miss: do the full pseudo-legal scan
     int pseudo_moves[CHESS_MAX_MOVES];
     int pseudo_count = generate_pseudo_legal_moves(env, pseudo_moves, CHESS_MAX_MOVES);
 
@@ -873,12 +1154,12 @@ static void apply_move(ChessEnv* env, int from_sq, int to_sq) {
 
 static int check_game_end(ChessEnv* env, int has_legal) {
     // Threefold repetition
-    if (check_threefold_repetition(env)) {
+    if (env->enable_threefold_repetition && check_threefold_repetition(env)) {
         return GAME_REPETITION;
     }
 
     // Fifty-move rule
-    if (env->halfmove_clock >= 100) {
+    if (env->enable_50_move_rule && env->halfmove_clock >= 100) {
         return GAME_FIFTY_MOVE;
     }
 
@@ -985,9 +1266,9 @@ static int process_player_action(ChessEnv* env, int action, int player) {
             return 0;
         }
 
-        // Generate all legal moves and filter for this piece
+        // Generate all legal moves (cached) and filter for this piece
         int all_legal[CHESS_MAX_MOVES];
-        int num_legal = generate_legal_moves(env, all_legal, CHESS_MAX_MOVES);
+        int num_legal = generate_legal_moves_cached(env, all_legal, CHESS_MAX_MOVES);
 
         ps->valid_dest_count = 0;
         for (int i = 0; i < num_legal; i++) {
@@ -1092,6 +1373,18 @@ static int process_player_action(ChessEnv* env, int action, int player) {
             if (col_diff == 2) is_castling = 1;
         }
 
+        // Compute SEE value before applying move
+        int see_value = 0;
+        int is_capture = (cap_piece != EMPTY);
+        if (env->reward_see_hanging != 0.0f) {
+            if (is_capture) {
+                see_value = see_capture(env, from_sq, to_sq, moving, cap_piece, player);
+            } else {
+                see_value = see_square(env, from_sq, to_sq, moving, player);
+            }
+            env->last_see_value = see_value;
+        }
+
         // Valid move - apply it
         apply_move_ex(env, from_sq, to_sq, promo_piece);
 
@@ -1133,6 +1426,30 @@ static int process_player_action(ChessEnv* env, int action, int player) {
             env->rewards[player] += env->reward_castling;
         }
 
+        // SEE/hanging reward shaping
+        if (env->reward_see_hanging != 0.0f) {
+            if (is_capture && see_value < 0) {
+                // Bad capture (SEE negative): suppress positive material reward
+                // and apply hanging penalty
+                if (env->reward_material != 0.0f) {
+                    // Undo the positive material delta reward we just gave
+                    int mat_after_2 = compute_material_score(env, player) - compute_material_score(env, opp_player);
+                    int mat_delta_2 = mat_after_2 - mat_before;
+                    if (mat_delta_2 > 0) {
+                        // Suppress the positive reward
+                        env->rewards[player] -= env->reward_material * (float)mat_delta_2 / 100.0f;
+                    }
+                }
+                // Apply hanging penalty scaled by how bad the SEE is
+                env->rewards[player] += env->reward_see_hanging * (float)(-see_value) / 100.0f;
+            } else if (!is_capture && see_value < 0) {
+                // Quiet move to attacked square with negative SEE: hanging penalty
+                env->rewards[player] += env->reward_see_hanging * (float)(-see_value) / 100.0f;
+            }
+            // Capture with SEE >= 0: full material reward (no modification)
+            // SEE = 0 for safe moves: no penalty
+        }
+
         return 1; // Chess move completed
     }
 }
@@ -1149,7 +1466,7 @@ static void compute_valid_pieces_mask(ChessEnv* env, int player, unsigned char* 
     if (env->current_player != player) return; // Not our turn
 
     int all_legal[CHESS_MAX_MOVES];
-    int num_legal = generate_legal_moves(env, all_legal, CHESS_MAX_MOVES);
+    int num_legal = generate_legal_moves_cached(env, all_legal, CHESS_MAX_MOVES);
 
     // Track which from-squares appear in legal moves
     unsigned char has_legal_from[64];
@@ -1484,6 +1801,10 @@ void init(ChessEnv* env) {
     env->reward_material = 0.0f;
     env->reward_position = 0.0f;
     env->reward_castling = 0.0f;
+    env->reward_draw = 0.0f;
+    env->reward_see_hanging = 0.0f;
+    env->enable_50_move_rule = 1;
+    env->enable_threefold_repetition = 1;
     env->use_curriculum = 0;
 }
 
@@ -1513,6 +1834,11 @@ void c_reset(ChessEnv* env) {
     // Reset per-episode counters (log accumulates across episodes)
     env->episode_illegal_moves = 0.0f;
     env->episode_chess_moves = 0;
+
+    // Invalidate legal move cache
+    env->legal_moves_cache_count = -1;
+    env->legal_moves_key = 0;
+    env->legal_moves_side = -1;
 
     // Reset position history and record initial position
     env->position_history_count = 0;
@@ -1598,6 +1924,8 @@ void c_step(ChessEnv* env) {
             env->log.chess_moves += (float)env->episode_chess_moves;
             env->log.n += 1;
         } else if (result == GAME_REPETITION) {
+            env->rewards[0] += env->reward_draw;
+            env->rewards[1] += env->reward_draw;
             env->terminals[0] = 1;
             env->terminals[1] = 1;
 
@@ -1612,6 +1940,8 @@ void c_step(ChessEnv* env) {
             env->log.repetitions += 1;
             env->log.n += 1;
         } else if (result == GAME_STALEMATE || result == GAME_FIFTY_MOVE || result == GAME_INSUFFICIENT) {
+            env->rewards[0] += env->reward_draw;
+            env->rewards[1] += env->reward_draw;
             env->terminals[0] = 1;
             env->terminals[1] = 1;
 
@@ -1633,6 +1963,8 @@ void c_step(ChessEnv* env) {
     // Increment step count and check truncation
     env->step_count++;
     if (env->step_count >= env->max_steps && env->terminals[0] == 0) {
+        env->rewards[0] += env->reward_draw;
+        env->rewards[1] += env->reward_draw;
         env->terminals[0] = 1;
         env->terminals[1] = 1;
 

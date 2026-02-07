@@ -1,0 +1,501 @@
+{
+  "status": "complete",
+  "scope": "reward",
+  "analysis_date": "2026-02-07",
+  "analyst": "reward-eval",
+
+  "executive_summary": "Our engine has a rich, modular reward system with 12 configurable knobs (material, positional, capture, check, castling, SEE/hanging, repetition, draw, invalid piece/move, valid piece/move) plus game-end rewards. Fighter has a minimal system with only 3 signals: illegal_move_penalty, win/loss (+1/-1), and a hardcoded step penalty (-0.001). Our system is strictly superior in expressiveness but has several issues: incomplete PST coverage, no phase-awareness, potential reward hacking vectors, and the SEE interaction with material rewards is fragile.",
+
+  "assumptions": [
+    "A1: Self-play means reward symmetry is critical - any asymmetry creates training instability",
+    "A2: Reward shaping should guide early training but fade as the agent improves (curriculum-like)",
+    "A3: All reward components should be independently toggleable for ablation studies",
+    "A4: Fighter's simplicity (sparse rewards) is a valid baseline; our shaping should demonstrably improve over it",
+    "A5: Phase-aware rewards (opening/middle/endgame) improve learning by focusing on phase-appropriate goals",
+    "A6: Reward magnitudes must be calibrated so shaping signals don't overwhelm game-end signals"
+  ],
+
+  "file_analysis": {
+    "our_chess_h": {
+      "path": "/home/alanga/rl-chess-selfplay/csrc/chess.h",
+      "reward_config_fields": {
+        "lines": "123-135, 150",
+        "fields": [
+          "reward_invalid_piece (-0.01)",
+          "reward_invalid_move (-0.01)",
+          "reward_valid_piece (0.0)",
+          "reward_valid_move (0.0)",
+          "reward_capture_bonus (0.0)",
+          "reward_check_bonus (0.0)",
+          "reward_repetition (0.0)",
+          "reward_material (0.0)",
+          "reward_position (0.0)",
+          "reward_castling (0.0)",
+          "reward_draw (0.0)",
+          "reward_see_hanging (0.0)"
+        ]
+      },
+      "material_computation": {
+        "function": "compute_material_score",
+        "line": 295,
+        "method": "Full board scan, sum PIECE_VALUES for own pieces",
+        "values": "P=100, N=320, B=330, R=500, Q=900, K=0 (centipawns)",
+        "note": "Called TWICE per move (before + after) for delta. O(64) per call."
+      },
+      "positional_computation": {
+        "function": "compute_positional_score",
+        "line": 308,
+        "method": "Full board scan, sum PST values for own pieces",
+        "tables": "Only PAWN_PST and KNIGHT_PST implemented (lines 271-292)",
+        "missing": "No PST for Bishop, Rook, Queen, King - default case returns 0",
+        "note": "Called TWICE per move (before + after) for delta. O(64) per call."
+      },
+      "move_rewards": {
+        "function": "process_player_action",
+        "lines": "1350-1451",
+        "flow": [
+          "1. Capture bonus: scaled by captured piece value / 900 (line 1397-1400)",
+          "2. Check bonus: flat bonus if move gives check (line 1403-1408)",
+          "3. Material delta: (own-opp after) - (own-opp before), scaled by reward_material/100 (line 1411-1415)",
+          "4. Positional delta: same pattern as material (line 1418-1422)",
+          "5. Castling bonus: flat one-time bonus (line 1425-1427)",
+          "6. SEE/hanging: if capture with SEE<0, suppress positive material reward and apply penalty (line 1430-1451)"
+        ]
+      },
+      "game_end_rewards": {
+        "function": "c_step",
+        "lines": "1905-1957, 1965-1969",
+        "checkmate": "+1.0 winner, -1.0 loser (hardcoded, line 1908-1909)",
+        "draw": "reward_draw for both players (repetition/stalemate/50-move/insufficient, lines 1927-1944)",
+        "truncation": "reward_draw for both players (line 1966-1967)",
+        "repetition_penalty": "Per-move penalty when position repeated >=2x (line 1895-1900)"
+      },
+      "see_implementation": {
+        "lines": "340-560",
+        "description": "Full SEE with x-ray discovery, alternating captures, minimax gain array",
+        "see_capture": "For captures: evaluates exchange on to_sq (line 476-524)",
+        "see_square": "For quiet moves: checks if moving to attacked square is losing (line 529-560)",
+        "values": "Separate SEE_PIECE_VALUES with K=20000 (line 345-359)"
+      }
+    },
+
+    "fighter_chess_h": {
+      "path": "/home/alanga/.local/lib/python3.12/site-packages/pufferlib/ocean/chess/chess.h",
+      "reward_system": {
+        "total_signals": 3,
+        "signals": [
+          "illegal_move_penalty: -0.1 (hardcoded default, line 813, configurable via binding)",
+          "win/loss: +1.0 / -1.0 (hardcoded, lines 910-911)",
+          "step_penalty: -0.001 per step to the moving player (hardcoded, line 934)"
+        ],
+        "draw_reward": "0.0 (no explicit draw reward, just terminal)",
+        "no_material_reward": true,
+        "no_positional_reward": true,
+        "no_capture_bonus": true,
+        "no_check_bonus": true,
+        "no_see": true,
+        "no_pst": true
+      },
+      "game_end": {
+        "checkmate": "+1 winner, -1 loser (line 910-911)",
+        "stalemate_50_insufficient": "Both terminals set, no reward given (line 923-931)",
+        "truncation": "Both terminals set, no reward given (line 942-950)"
+      }
+    },
+
+    "fighter_binding_c": {
+      "path": "/home/alanga/.local/lib/python3.12/site-packages/pufferlib/ocean/chess/binding.c",
+      "configurable_params": ["max_steps", "illegal_move_penalty", "num_games"],
+      "note": "Only 3 kwargs - no reward shaping parameters at all"
+    },
+
+    "our_binding_c": {
+      "path": "/home/alanga/rl-chess-selfplay/csrc/binding.c",
+      "configurable_params": 19,
+      "note": "All 12 reward params + max_steps, illegal_move_penalty, num_games, enable_50_move_rule, enable_threefold_repetition, fen_file, fen_curric_pct"
+    },
+
+    "our_config_ini": {
+      "path": "/home/alanga/rl-chess-selfplay/config/chess.ini",
+      "note": "Config only sets num_envs=2048, max_steps=256, illegal_move_penalty=-0.1. ALL reward shaping params default to 0.0 - effectively running with fighter-level sparse rewards currently."
+    }
+  },
+
+  "comparison_table": {
+    "material_reward": {
+      "fighter": "NONE",
+      "ours": "Delta-based, (own-opp after) - (own-opp before), scaled by reward_material/100. Default off.",
+      "verdict": "GOOD design - incremental delta avoids absolute magnitude issues. But O(128) per move (2x64 scan before + after)."
+    },
+    "positional_reward": {
+      "fighter": "NONE",
+      "ours": "Delta-based, same pattern as material. Only Pawn+Knight PSTs. Default off.",
+      "verdict": "INCOMPLETE - missing B/R/Q/K PSTs makes this biased toward pawn play."
+    },
+    "capture_bonus": {
+      "fighter": "NONE",
+      "ours": "Flat bonus scaled by captured_piece_value/900. Independent of material delta.",
+      "verdict": "RISK - double-counts with material delta. Capturing Q gives material delta AND capture bonus."
+    },
+    "check_bonus": {
+      "fighter": "NONE",
+      "ours": "Flat bonus for giving check. Default off.",
+      "verdict": "RISK - can reward pointless checks. Should be gated on phase or quality."
+    },
+    "castling_bonus": {
+      "fighter": "NONE",
+      "ours": "Flat one-time bonus. Default off.",
+      "verdict": "OK but minor. Phase-appropriate (opening only)."
+    },
+    "see_hanging": {
+      "fighter": "NONE",
+      "ours": "Full SEE implementation. Penalizes bad captures (SEE<0) and quiet moves to attacked squares.",
+      "verdict": "SOPHISTICATED - fighter has nothing comparable. The SEE suppress-material-then-penalize logic (lines 1430-1451) is fragile."
+    },
+    "repetition": {
+      "fighter": "NONE (no repetition tracking at all)",
+      "ours": "Per-move penalty when position seen >=2x. Plus threefold triggers GAME_REPETITION.",
+      "verdict": "GOOD - discourages draw-by-repetition."
+    },
+    "game_end": {
+      "fighter": "+1/-1 checkmate, 0 draw, 0 truncation",
+      "ours": "+1/-1 checkmate, configurable reward_draw for all draw types + truncation",
+      "verdict": "GOOD - configurable draw penalty can discourage passive play."
+    },
+    "step_penalty": {
+      "fighter": "-0.001 per step to moving player (hardcoded, line 934)",
+      "ours": "NONE (no step penalty)",
+      "verdict": "Fighter's step penalty encourages shorter games. We should consider adding this."
+    },
+    "illegal_move": {
+      "fighter": "-0.1 + random legal move (line 879-885)",
+      "ours": "Two-phase: invalid_piece (-0.01) and invalid_move (-0.01) separate from illegal_move_penalty (-0.1)",
+      "verdict": "BETTER granularity. Phase-0 errors are cheaper than phase-1 errors."
+    }
+  },
+
+  "issues_found": [
+    {
+      "id": "ISS-01",
+      "severity": "HIGH",
+      "title": "Incomplete PST coverage",
+      "description": "compute_positional_score (line 308-328) only has tables for Pawn and Knight. Bishop, Rook, Queen, King all fall through to default (0). This biases positional reward toward pawn structure and knight placement, ignoring rook placement on open files, king safety, bishop pair value, etc.",
+      "line": "chess.h:321-325"
+    },
+    {
+      "id": "ISS-02",
+      "severity": "MEDIUM",
+      "title": "Capture bonus double-counts with material delta",
+      "description": "When reward_capture_bonus AND reward_material are both nonzero, a capture gives BOTH the material delta reward AND the capture bonus. Example: capturing an undefended queen gives material delta of +900cp (scaled) PLUS capture bonus of reward_capture_bonus * 900/900. This is double-counting.",
+      "line": "chess.h:1396-1415"
+    },
+    {
+      "id": "ISS-03",
+      "severity": "MEDIUM",
+      "title": "SEE suppress logic is fragile and incomplete",
+      "description": "When SEE<0 for a capture, the code suppresses the positive material reward by re-computing mat_delta (line 1436-1441). But it only suppresses if mat_delta > 0. If the capture was a recapture (mat_delta=0 or negative), the SEE penalty still applies but no material reward is suppressed. Also, the code calls compute_material_score 4 times total when SEE<0 (lines 1363, 1412, 1436) - expensive.",
+      "line": "chess.h:1430-1451"
+    },
+    {
+      "id": "ISS-04",
+      "severity": "MEDIUM",
+      "title": "No phase awareness in reward shaping",
+      "description": "All reward weights are static throughout the game. In real chess, different factors matter in different phases: development/castling in opening, material/tactics in middle game, king activity/passed pawns in endgame. Current system applies identical weights regardless.",
+      "line": "chess.h:97-155 (struct fields)"
+    },
+    {
+      "id": "ISS-05",
+      "severity": "LOW",
+      "title": "Check bonus can reward pointless checks",
+      "description": "Flat reward_check_bonus for any check, including useless discovered checks or checks that lose material. Could incentivize check-spamming rather than meaningful attacks.",
+      "line": "chess.h:1403-1408"
+    },
+    {
+      "id": "ISS-06",
+      "severity": "LOW",
+      "title": "No step penalty equivalent to fighter",
+      "description": "Fighter applies -0.001 per step to incentivize faster games. We have no equivalent. Without this, the agent may learn to prolong games indefinitely if shaping rewards (material gains) accumulate.",
+      "line": "fighter chess.h:934"
+    },
+    {
+      "id": "ISS-07",
+      "severity": "INFO",
+      "title": "Material/positional computation is O(128) per move",
+      "description": "compute_material_score and compute_positional_score each scan all 64 squares. Called twice per move (before+after) = 256 square visits. With SEE penalty, mat score computed a 3rd time. Could use incremental updates for performance.",
+      "line": "chess.h:295-328, 1363-1364, 1412-1419"
+    },
+    {
+      "id": "ISS-08",
+      "severity": "HIGH",
+      "title": "Reward hacking: repetition-farming for shaping rewards",
+      "description": "If material or positional rewards are enabled, the agent could learn to repeatedly capture-recapture sequences that generate positive material deltas each way. The repetition penalty (reward_repetition) only triggers on exact position repeats. An agent could vary the position slightly to avoid repetition detection while still farming shaping rewards.",
+      "line": "chess.h:1895-1900"
+    },
+    {
+      "id": "ISS-09",
+      "severity": "MEDIUM",
+      "title": "Draw reward applies to truncation",
+      "description": "When max_steps is reached, both players get reward_draw (line 1966-1967). If reward_draw is negative (punishing draws), this penalizes both players for long games. Combined with no step penalty, the agent has no intermediate signal to avoid reaching truncation - it only learns from the terminal penalty.",
+      "line": "chess.h:1965-1969"
+    },
+    {
+      "id": "ISS-10",
+      "severity": "INFO",
+      "title": "episode_return only tracks White's reward",
+      "description": "Log.episode_return always records env->rewards[0] (White's perspective). In self-play with symmetric training, this is OK but can be misleading in logs if draw rewards are asymmetric or shaping rewards create asymmetry.",
+      "line": "chess.h:1914, 1932, 1948"
+    }
+  ],
+
+  "changes": [
+    {
+      "id": "REW-01",
+      "title": "Complete PST tables for all piece types",
+      "description": "Add Bishop, Rook, Queen, and King piece-square tables to compute_positional_score. Use standard chess programming PSTs (e.g., from Chess Programming Wiki). King needs two tables: middlegame (prefers castled corner) and endgame (prefers center).",
+      "files": ["csrc/chess.h"],
+      "lines": "271-328 (add BISHOP_PST, ROOK_PST, QUEEN_PST, KING_MG_PST, KING_EG_PST; update switch in compute_positional_score)",
+      "priority": "P1",
+      "risk": "Low - additive only, default weights still 0.0",
+      "acceptance": [
+        "All 6 piece types have PST entries",
+        "PSTs are symmetric: PST[mirror(sq)] should be equal for pieces that are side-symmetric",
+        "compute_positional_score returns nonzero for all piece types",
+        "Unit test: starting position positional score should be equal for both sides"
+      ]
+    },
+    {
+      "id": "REW-02",
+      "title": "Add game phase detection and phase-aware reward weights",
+      "description": "Compute game phase based on total non-pawn material (standard tapered eval approach). Phase = total_material / start_material. Add separate reward weights for opening/endgame that interpolate. Requires new config fields: reward_material_eg, reward_position_eg, etc. King PST should interpolate between MG and EG tables.",
+      "files": ["csrc/chess.h", "csrc/binding.c", "chess_env.py"],
+      "lines": "New function compute_game_phase() near line 295; modify process_player_action lines 1411-1422 to use phase-interpolated weights",
+      "priority": "P2",
+      "risk": "Medium - adds complexity. Start with just King PST interpolation, expand later.",
+      "acceptance": [
+        "compute_game_phase returns value in [0.0, 1.0] where 0=endgame, 1=opening",
+        "King PST interpolates between MG and EG tables based on phase",
+        "All existing reward behavior unchanged when new params are at defaults",
+        "Unit test: starting position phase ~1.0, K-vs-K phase ~0.0"
+      ]
+    },
+    {
+      "id": "REW-03",
+      "title": "Fix capture bonus double-counting with material delta",
+      "description": "Option A: Make capture_bonus mutually exclusive with material delta (apply capture_bonus ONLY if reward_material == 0). Option B: Remove capture_bonus entirely since material delta already covers it. Option C: Document that they stack and leave as-is for user choice. Recommendation: Option A - capture_bonus is the simpler signal for early training; material delta is the sophisticated one.",
+      "files": ["csrc/chess.h"],
+      "lines": "1396-1400 (add guard: if reward_material == 0.0f)",
+      "priority": "P2",
+      "risk": "Low",
+      "acceptance": [
+        "When both reward_capture_bonus and reward_material are nonzero, only material delta applies",
+        "When reward_material is 0, capture_bonus applies normally",
+        "Document this behavior in a comment"
+      ]
+    },
+    {
+      "id": "REW-04",
+      "title": "Add reward_step_penalty config field",
+      "description": "Add configurable per-step penalty to the moving player (like fighter's -0.001). This prevents reward farming and encourages efficient play. Default 0.0 (off) for backward compat, recommended -0.001.",
+      "files": ["csrc/chess.h", "csrc/binding.c", "chess_env.py", "config/chess.ini"],
+      "lines": "New field in ChessEnv struct (after reward_see_hanging); apply in c_step after move_made check; add to binding kwargs",
+      "priority": "P1",
+      "risk": "Low - simple additive field",
+      "acceptance": [
+        "New reward_step_penalty field in ChessEnv, default 0.0",
+        "Applied to moving player each step (NOT both players)",
+        "Configurable via binding kwargs and chess_env.py",
+        "Setting to -0.001 matches fighter behavior"
+      ]
+    },
+    {
+      "id": "REW-05",
+      "title": "Simplify SEE reward interaction with material delta",
+      "description": "Current SEE logic (lines 1430-1451) re-computes material score and conditionally suppresses it. Simplify: compute SEE BEFORE material delta. If SEE<0, set a flag and skip the material delta entirely for this move, then apply SEE penalty. This is cleaner and avoids the 3rd material computation.",
+      "files": ["csrc/chess.h"],
+      "lines": "Restructure 1376-1451: move SEE computation before apply_move (already done at 1376-1386), then gate material delta on see_value >= 0",
+      "priority": "P2",
+      "risk": "Medium - changes reward semantics slightly. Bad captures get ONLY the SEE penalty, not a partial material reward.",
+      "acceptance": [
+        "SEE<0 captures: only SEE penalty applied, no material delta",
+        "SEE>=0 captures: full material delta applied, no SEE adjustment",
+        "Quiet moves with SEE<0: SEE penalty applied (no change)",
+        "compute_material_score called max 2 times per move (before + after), never 3+",
+        "Unit test: bad capture scenario gives consistent penalty"
+      ]
+    },
+    {
+      "id": "REW-06",
+      "title": "Add reward magnitude guardrail / normalization",
+      "description": "Add a reward_clip or reward_scale field that ensures total per-step reward never exceeds a configurable fraction of the game-end reward. This prevents shaping signals from overwhelming the sparse win/loss signal. Recommendation: soft clip total shaping reward to [-0.5, 0.5] so game-end +/-1.0 is always dominant.",
+      "files": ["csrc/chess.h"],
+      "lines": "After all shaping rewards applied in process_player_action (after line 1451), add clipping",
+      "priority": "P1",
+      "risk": "Low - safety measure",
+      "acceptance": [
+        "New reward_shaping_clip field, default 0.5",
+        "Total per-step shaping reward (excluding game-end) clipped to [-clip, +clip]",
+        "Game-end rewards (+1/-1) NOT affected by clip",
+        "Configurable via binding kwargs"
+      ]
+    },
+    {
+      "id": "REW-07",
+      "title": "Add anti-farming guard for material delta cycles",
+      "description": "Track cumulative material delta per episode. If total shaping material reward exceeds a threshold (e.g., 2.0) without game ending, scale down subsequent material rewards. This prevents the agent from farming material cycles.",
+      "files": ["csrc/chess.h"],
+      "lines": "New field cumulative_material_reward in ChessEnv; check in material delta section (line 1411-1415)",
+      "priority": "P3",
+      "risk": "Medium - adds state tracking, may interfere with legitimate long material advantage games",
+      "acceptance": [
+        "New cumulative_material_reward field, reset on c_reset",
+        "Tracks running sum of material delta rewards per episode",
+        "When cumulative exceeds threshold (configurable, default 2.0), subsequent material rewards scaled by 0.5",
+        "Threshold configurable via binding kwargs"
+      ]
+    },
+    {
+      "id": "REW-08",
+      "title": "Reward symmetry verification test suite",
+      "description": "Create a test that verifies reward symmetry: given a position and the same move type, White and Black receive identical magnitude rewards (just assigned to opposite player indices). Test all reward components independently.",
+      "files": ["tests/test_reward_symmetry.py (new)"],
+      "lines": "N/A - new file",
+      "priority": "P1",
+      "risk": "None - test only",
+      "acceptance": [
+        "Test: White pawn capture of black knight gives same reward as Black pawn capture of white knight",
+        "Test: White checkmate gives +1 to [0], Black checkmate gives +1 to [1]",
+        "Test: Draw rewards are equal for both players",
+        "Test: Material delta is player-relative (own - opponent)",
+        "Test: PST scoring is symmetric after board flip",
+        "Test: SEE values are symmetric for mirrored positions",
+        "All tests pass"
+      ]
+    },
+    {
+      "id": "REW-09",
+      "title": "Ablation toggle documentation and config presets",
+      "description": "Create config presets for common reward configurations: (1) sparse (fighter-equivalent), (2) shaped-basic (material+position), (3) shaped-full (all components), (4) shaped-aggressive (high capture/check bonuses). Document each preset and expected training behavior.",
+      "files": ["config/chess.ini", "config/chess_sparse.ini (new)", "config/chess_shaped.ini (new)"],
+      "lines": "N/A - config files",
+      "priority": "P2",
+      "risk": "None - config only",
+      "acceptance": [
+        "At least 3 config presets with documented purpose",
+        "Sparse preset exactly matches fighter behavior (with reward_step_penalty=-0.001)",
+        "Each preset has a comment block explaining the reward philosophy",
+        "Running with each preset produces different training curves (manual verification)"
+      ]
+    },
+    {
+      "id": "REW-10",
+      "title": "Incremental material/positional score updates",
+      "description": "Instead of scanning all 64 squares before and after each move, compute the delta incrementally from the move itself. For a move from_sq->to_sq: material delta = value(captured) for captures; positional delta = PST[to_sq] - PST[from_sq] + promotion bonus. This reduces per-move cost from O(256) to O(1).",
+      "files": ["csrc/chess.h"],
+      "lines": "Replace compute_material_score/compute_positional_score calls in process_player_action (1361-1422) with incremental computation",
+      "priority": "P3",
+      "risk": "Medium - must handle all edge cases: en passant, castling (rook PST change), promotion (piece type change)",
+      "acceptance": [
+        "No full board scan for material/positional delta during normal moves",
+        "Incremental results match full-scan results for: normal moves, captures, en passant, castling, promotion",
+        "Unit test comparing incremental vs full-scan for 1000 random games",
+        "Performance benchmark shows measurable improvement"
+      ]
+    },
+    {
+      "id": "REW-11",
+      "title": "Check bonus gated on SEE quality",
+      "description": "Only apply check bonus when the checking move has SEE >= 0 (the check is not a blunder). This prevents rewarding pointless sacrifice checks. If SEE is disabled (reward_see_hanging == 0), apply check bonus unconditionally.",
+      "files": ["csrc/chess.h"],
+      "lines": "1403-1408 (add see_value >= 0 guard)",
+      "priority": "P3",
+      "risk": "Low",
+      "acceptance": [
+        "Check bonus only applied when SEE >= 0 or when SEE is disabled",
+        "Sacrifice checks (SEE<0) do not get check bonus",
+        "Existing behavior unchanged when reward_see_hanging == 0"
+      ]
+    },
+    {
+      "id": "REW-12",
+      "title": "Separate truncation reward from draw reward",
+      "description": "Add reward_truncation field separate from reward_draw. Truncation (max_steps reached) and draws (stalemate/repetition/50-move) may warrant different penalties. Long indecisive games (truncation) should be penalized more than legitimate draws.",
+      "files": ["csrc/chess.h", "csrc/binding.c", "chess_env.py"],
+      "lines": "New field reward_truncation in ChessEnv; use in c_step truncation section (line 1965-1969)",
+      "priority": "P3",
+      "risk": "Low",
+      "acceptance": [
+        "New reward_truncation field, default equal to reward_draw for backward compat",
+        "Truncation uses reward_truncation, draws use reward_draw",
+        "Both independently configurable via binding kwargs"
+      ]
+    }
+  ],
+
+  "priority_ordering": {
+    "P1_must_have": ["REW-01 (complete PSTs)", "REW-04 (step penalty)", "REW-06 (reward clip guardrail)", "REW-08 (symmetry tests)"],
+    "P2_should_have": ["REW-02 (phase awareness)", "REW-03 (double-count fix)", "REW-05 (SEE simplification)", "REW-09 (config presets)"],
+    "P3_nice_to_have": ["REW-07 (anti-farming)", "REW-10 (incremental computation)", "REW-11 (check quality gate)", "REW-12 (truncation reward)"]
+  },
+
+  "reward_symmetry_analysis": {
+    "verdict": "SYMMETRIC - no perspective leaking detected",
+    "details": [
+      "Material delta: computed as own-opponent for each player independently (line 1363, 1412). Symmetric.",
+      "Positional delta: PST mirror correctly handled (line 319). Symmetric.",
+      "Capture bonus: uses captured_piece_value which indexes by actual piece code. Symmetric.",
+      "Check bonus: uses is_in_check(env, opponent). Symmetric.",
+      "Game-end: winner always gets +1, loser always gets -1. Symmetric.",
+      "Draw: both players get identical reward_draw. Symmetric.",
+      "Rewards are written to env->rewards[player] where player is the current mover. Correct.",
+      "rewards[0] and rewards[1] are independently addressable via binding pointer arithmetic. No leaking."
+    ],
+    "potential_issue": "episode_return in logs only records rewards[0] (White). Not a reward leak but an observability asymmetry."
+  },
+
+  "reward_hacking_analysis": {
+    "vectors": [
+      {
+        "id": "HACK-01",
+        "description": "Material farming via repeated capture-recapture cycles with slight position variation to avoid repetition detection",
+        "severity": "HIGH",
+        "mitigation": "REW-07 (anti-farming guard) + REW-04 (step penalty) + REW-06 (reward clip)"
+      },
+      {
+        "id": "HACK-02",
+        "description": "Check spamming for reward_check_bonus without meaningful attacking intent",
+        "severity": "MEDIUM",
+        "mitigation": "REW-11 (SEE-gated check bonus)"
+      },
+      {
+        "id": "HACK-03",
+        "description": "Sacrificing pieces for positional score gains (PST values can sometimes increase with bad piece placement)",
+        "severity": "LOW",
+        "mitigation": "Material delta naturally penalizes piece loss. REW-06 clips total shaping."
+      },
+      {
+        "id": "HACK-04",
+        "description": "Prolonging games to accumulate small positional/material advantages without attempting to win",
+        "severity": "MEDIUM",
+        "mitigation": "REW-04 (step penalty) + REW-06 (reward clip) + reward_draw negative for truncation"
+      }
+    ]
+  },
+
+  "recommended_initial_config": {
+    "description": "Recommended starting configuration for training with shaped rewards",
+    "config": {
+      "reward_material": 0.01,
+      "reward_position": 0.005,
+      "reward_capture_bonus": 0.0,
+      "reward_check_bonus": 0.005,
+      "reward_castling": 0.02,
+      "reward_repetition": -0.02,
+      "reward_draw": -0.1,
+      "reward_see_hanging": -0.01,
+      "reward_step_penalty": -0.001,
+      "reward_invalid_piece": -0.01,
+      "reward_invalid_move": -0.01
+    },
+    "rationale": "Material and position at small scales (0.01, 0.005) so total shaping per move is ~0.01-0.05, far below game-end +/-1.0. Capture bonus disabled since material delta covers it. Check and castling as small bonuses. Repetition and draw penalties discourage passive play. SEE penalty at -0.01 to discourage blunders. Step penalty matches fighter."
+  }
+}

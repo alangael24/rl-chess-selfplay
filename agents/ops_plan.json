@@ -1,0 +1,188 @@
+{
+  "status": "complete",
+  "scope": "ops",
+  "assumptions": [
+    "Fighter (installed pufferlib ocean chess) is the baseline for feature comparison",
+    "Fighter has a much simpler architecture: 72 obs, 4096 actions, no FEN, no reward shaping, no random bot, no human play, no render, no PGN, no debug hooks",
+    "Our env already has FEN curriculum (fen_file + fen_curric_pct), reward shaping, SEE, threefold repetition, and many more features than fighter",
+    "The new architecture (per other agent plans) may change to 1-agent-per-env, which affects how some ops features are wired",
+    "human_play, render, PGN, and random_bot are purely additive features that do not disrupt existing training",
+    "starting_fen (single fixed FEN for all games) is distinct from fen_curric_pct (random FEN from file with probability)"
+  ],
+  "changes": [
+    {
+      "id": "OPS-01",
+      "title": "Add starting_fen config parameter",
+      "scope": "chess.h + binding.c + chess_env.py + config/chess.ini",
+      "description": "Add a 'starting_fen' string kwarg that, when set, initializes ALL games from that FEN on every reset (instead of standard starting position). Unlike fen_curric_pct (probabilistic, from a file), starting_fen is deterministic and always applies. Useful for debugging specific positions and targeted training. In C: store a char[256] starting_fen in ChessEnv or VecEnv; in c_reset, if starting_fen[0] != 0, call setup_from_fen() instead of setup_initial_board(). In binding.c: parse 'starting_fen' string kwarg in vec_init. In chess_env.py: accept starting_fen param, pass to binding. In config: add starting_fen = '' (empty = standard start).",
+      "priority": "high",
+      "gap_analysis": "Fighter has NO FEN support at all. Our env has fen_curric_pct + fen_file but lacks a simple 'always start from this FEN' option. starting_fen is complementary.",
+      "acceptance": [
+        "starting_fen='' => standard starting position (no change)",
+        "starting_fen='rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1' => all games start from 1.e4",
+        "starting_fen interacts correctly with fen_curric_pct: if both set, fen_curric_pct overrides with probability p, else starting_fen is used",
+        "CLI: --env.starting-fen 'FEN_STRING' works"
+      ]
+    },
+    {
+      "id": "OPS-02",
+      "title": "Add random_bot opponent mode",
+      "scope": "chess.h + binding.c + chess_env.py + config/chess.ini",
+      "description": "Add a 'random_bot_pct' float kwarg (0.0-1.0). With probability random_bot_pct, one side (Black by default, or configurable via 'random_bot_color') plays uniformly random legal moves instead of using the policy. Implementation: in c_step, after reading the current player's action, if that player is the random bot, ignore their action and pick a random legal move (already have chess_rand_int + generate_legal_moves). In VecEnv, store random_bot_pct and per-game random_bot_active flag set on reset. In 1-agent topology (where only one side is the learner), the random bot would be the non-learner side. Useful for curriculum: start training against random, gradually reduce random_bot_pct.",
+      "priority": "high",
+      "gap_analysis": "Fighter has NO random bot support. Our env also lacks it. This is a key curriculum feature for early training.",
+      "acceptance": [
+        "random_bot_pct=0.0 => pure self-play (no change)",
+        "random_bot_pct=1.0 => one side always plays random legal moves",
+        "random_bot_pct=0.5 => 50% of games have a random bot opponent",
+        "Random bot always picks uniformly from legal moves",
+        "Per-game flag is set at reset time (not per-step)",
+        "CLI: --env.random-bot-pct 0.5 works",
+        "Log field: 'random_bot_games' tracks fraction of games with random bot"
+      ]
+    },
+    {
+      "id": "OPS-03",
+      "title": "Add ASCII board render function in C",
+      "scope": "chess.h + binding.c + chess_env.py",
+      "description": "Add a C function board_to_ascii(ChessEnv* env, char* buf, int bufsize) that writes an ASCII representation of the board to buf (8 lines of 8 chars with file/rank labels, piece chars: KQRBNPkqrbnp, '.' for empty). Add a Python-callable vec_render(handle, game_index) that returns the ASCII string. In chess_env.py, implement render() to call vec_render for game 0 and print to stdout. Also add render_mode='ansi' support returning the string.",
+      "priority": "medium",
+      "gap_analysis": "Fighter has render() as a no-op (pass). Our env also has render() as no-op. Basic ASCII rendering is essential for debugging and human play.",
+      "acceptance": [
+        "render() prints an 8x8 ASCII board with piece symbols",
+        "render_mode='ansi' returns the string without printing",
+        "Board is shown from White's perspective with file (a-h) and rank (1-8) labels",
+        "Current player indicator: 'White to move' or 'Black to move'",
+        "Move number and halfmove clock shown"
+      ]
+    },
+    {
+      "id": "OPS-04",
+      "title": "Add PGN export / move history tracking",
+      "scope": "chess.h + binding.c + chess_env.py",
+      "description": "Track move history per game for PGN export. In ChessEnv, add int move_history[512] (encoded as from*64+to) and int move_history_count. In apply_move_ex, record each move. Add a C function game_to_pgn(ChessEnv* env, char* buf, int bufsize) that converts the move history to standard algebraic notation (SAN) PGN. Add a Python-callable vec_get_pgn(handle, game_index) returning the PGN string. Add a vec_save_pgns(handle, filepath) that dumps all completed game PGNs to a file. Useful for post-training analysis and debugging.",
+      "priority": "medium",
+      "gap_analysis": "Neither fighter nor our env tracks move history or exports PGN. This is critical for understanding what the agent actually learns.",
+      "acceptance": [
+        "Move history is recorded in C for each game",
+        "PGN output includes standard headers: Event, White, Black, Result",
+        "Moves are in standard algebraic notation (e.g., 'e4', 'Nf3', 'O-O')",
+        "vec_get_pgn(handle, 0) returns valid PGN string",
+        "PGN can be loaded in standard chess tools (lichess, chess.com analysis)",
+        "Move history resets on game reset",
+        "Optional: save PGN every N episodes to a file via callback"
+      ]
+    },
+    {
+      "id": "OPS-05",
+      "title": "Add human_play interactive mode",
+      "scope": "chess_env.py (new function or script)",
+      "description": "Add a human_play() function (or human_play.py script) that runs a single game between a human and the trained policy. Terminal-based: render board as ASCII, prompt human for moves in UCI notation (e.g., 'e2e4'), validate, step the env. Load a checkpoint, create a single-game env, alternate between human input and policy inference. Requires: render (OPS-03), a way to load a checkpoint and run inference. The human can choose to play White or Black. Ctrl+C to quit. Optionally show policy's move probabilities.",
+      "priority": "medium",
+      "gap_analysis": "Neither fighter nor our env has human play. Essential for qualitative evaluation.",
+      "acceptance": [
+        "python human_play.py --checkpoint path/to/model.pt --color white",
+        "ASCII board rendered after each move",
+        "Human enters moves in UCI format: 'e2e4' (from_sq to_sq)",
+        "Invalid moves are rejected with a message, user re-prompted",
+        "Game ends naturally (checkmate/stalemate/draw) with result shown",
+        "Policy inference uses the loaded checkpoint",
+        "Works with both Policy and ChessLSTM models"
+      ]
+    },
+    {
+      "id": "OPS-06",
+      "title": "Add seed reproducibility and state dump",
+      "scope": "chess.h + binding.c + chess_env.py",
+      "description": "Ensure full deterministic replay given a seed. Add vec_get_state(handle, game_index) -> dict with all game state (board, castling, ep, halfmove, fullmove, current_player, step_count, rng_state, move_history). Add vec_set_state(handle, game_index, state_dict) to restore. Useful for debugging specific sequences. Also add a vec_get_rng_state(handle, game_index) and vec_set_rng_state for reproducibility testing.",
+      "priority": "low",
+      "gap_analysis": "Fighter has seed in vec_reset but no state dump/restore. Our env has seed in vec_reset and rng_state per game. Missing: Python-accessible state dump for debugging.",
+      "acceptance": [
+        "vec_get_state returns a dict with complete game state",
+        "vec_set_state restores a game to exact prior state",
+        "Two runs with the same seed produce identical game sequences",
+        "State can be serialized to JSON for logging"
+      ]
+    },
+    {
+      "id": "OPS-07",
+      "title": "Add comprehensive CLI/config flags documentation and missing flags",
+      "scope": "config/chess.ini + chess_env.py",
+      "description": "Ensure all env parameters are exposed in config/chess.ini and documented. Current missing flags to add: (1) starting_fen (from OPS-01), (2) random_bot_pct (from OPS-02), (3) random_bot_color (default 'black'), (4) render_interval (how often to render during training, 0=never), (5) pgn_save_interval (save PGN every N episodes, 0=never), (6) pgn_save_path (directory for PGN files). Also add comments in the .ini file explaining each parameter.",
+      "priority": "medium",
+      "gap_analysis": "Fighter config has only: num_envs, max_steps, illegal_move_penalty, report_interval. Our config already has all reward shaping params + FEN curriculum. Need to add the new ops features.",
+      "acceptance": [
+        "Every env kwarg appears in chess.ini with a default value",
+        "Comments in .ini explain each parameter",
+        "CLI override works: --env.random-bot-pct 0.5",
+        "New parameters have sensible defaults that don't change existing behavior"
+      ]
+    },
+    {
+      "id": "OPS-08",
+      "title": "Add FEN board-to-string utility for logging",
+      "scope": "chess.h + binding.c",
+      "description": "Add a C function board_to_fen(ChessEnv* env, char* buf, int bufsize) that exports the current board state as a FEN string. Add a Python-callable vec_get_fen(handle, game_index) returning the FEN string. Useful for: logging interesting positions, creating FEN curriculum files from training runs, debugging.",
+      "priority": "low",
+      "gap_analysis": "Our env has setup_from_fen (FEN parser) but no board_to_fen (FEN writer). Fighter has neither. Symmetric FEN read/write is useful.",
+      "acceptance": [
+        "board_to_fen produces valid FEN strings",
+        "Round-trip: setup_from_fen(board_to_fen(env)) == identity",
+        "vec_get_fen(handle, 0) returns FEN string from Python",
+        "FEN includes all 6 fields (pieces, side, castling, ep, halfmove, fullmove)"
+      ]
+    },
+    {
+      "id": "OPS-09",
+      "title": "Add training callback hooks for periodic PGN/FEN logging",
+      "scope": "chess_env.py or train_chess.py",
+      "description": "Add optional callback support in the env's step() method or as a separate training hook: (1) Every pgn_save_interval episodes, save the last N completed game PGNs to pgn_save_path. (2) Every fen_log_interval steps, log the current board FEN for a sample of games. (3) Optional: save 'interesting' games (decisive games with few moves, long games, etc.) separately. This requires OPS-04 (PGN) and OPS-08 (FEN export).",
+      "priority": "low",
+      "gap_analysis": "Neither fighter nor our env has any training-time debug artifact generation.",
+      "acceptance": [
+        "PGN files appear in pgn_save_path at the configured interval",
+        "FEN logging writes to a configurable log file or stdout",
+        "Callbacks don't measurably impact training throughput (<1% SPS loss)",
+        "Disabled by default (pgn_save_interval=0, fen_log_interval=0)"
+      ]
+    },
+    {
+      "id": "OPS-10",
+      "title": "Add dynamic FEN curriculum adjustment API",
+      "scope": "binding.c + chess_env.py",
+      "description": "We already have vec_load_fens and vec_set_fen_pct in our binding.c. Expose these in chess_env.py as methods: env.load_fens(path) and env.set_fen_pct(pct). This allows training scripts to dynamically adjust FEN curriculum during training (e.g., start at fen_curric_pct=0.5, gradually reduce to 0.0). Also add a method to get current fen_count and fen_curric_pct.",
+      "priority": "medium",
+      "gap_analysis": "The C API exists (vec_load_fens, vec_set_fen_pct) but chess_env.py doesn't expose them. Fighter has none of this.",
+      "acceptance": [
+        "env.load_fens('/path/to/new_fens.txt') loads new FEN file and returns count",
+        "env.set_fen_pct(0.3) updates curriculum percentage at runtime",
+        "env.fen_count and env.fen_pct properties return current values",
+        "Dynamic adjustment doesn't require env recreation"
+      ]
+    }
+  ],
+  "summary": {
+    "feature_gap_fighter_vs_ours": {
+      "fighter_has_we_dont": "Nothing. Fighter is strictly a subset. Fighter has: 72 obs, 4096 flat actions, no FEN, no reward shaping, no threefold repetition, no action masking, no move caching, no SEE, hardcoded -0.001 step penalty, random move on illegal action.",
+      "we_have_fighter_doesnt": "FEN curriculum (fen_file + fen_curric_pct), 20+ reward shaping params, SEE hanging detection, threefold repetition, action masking in obs, two-phase actions (97), legal move caching, int32/int64 action dtype support, dynamic FEN loading API, comprehensive logging (material_score, positional_score, chess_moves, repetitions, etc.)",
+      "neither_has": "random_bot, human_play, render, PGN export, board_to_fen, state dump/restore, starting_fen, training callbacks"
+    },
+    "priority_order": [
+      "OPS-01: starting_fen (high - simple, enables debugging)",
+      "OPS-02: random_bot_pct (high - key curriculum feature)",
+      "OPS-03: ASCII render (medium - needed by OPS-05)",
+      "OPS-04: PGN export (medium - needed by OPS-05, OPS-09)",
+      "OPS-05: human_play (medium - depends on OPS-03)",
+      "OPS-07: CLI/config flags (medium - document everything)",
+      "OPS-08: board_to_fen (low - nice to have)",
+      "OPS-10: dynamic FEN API exposure (medium - API exists, just expose)",
+      "OPS-06: state dump (low - debugging aid)",
+      "OPS-09: training callbacks (low - depends on OPS-04, OPS-08)"
+    ],
+    "dependencies": {
+      "OPS-05": ["OPS-03"],
+      "OPS-09": ["OPS-04", "OPS-08"],
+      "OPS-07": ["OPS-01", "OPS-02"]
+    }
+  }
+}

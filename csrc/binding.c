@@ -133,6 +133,11 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     float reward_material      = (float)unpack_kwarg(kwargs, "reward_material", 0.0);
     float reward_position      = (float)unpack_kwarg(kwargs, "reward_position", 0.0);
     float reward_castling      = (float)unpack_kwarg(kwargs, "reward_castling", 0.0);
+    float reward_draw          = (float)unpack_kwarg(kwargs, "reward_draw", 0.0);
+    int enable_50_move_rule    = (int)unpack_kwarg(kwargs, "enable_50_move_rule", 1);
+    int enable_threefold_repetition = (int)unpack_kwarg(kwargs, "enable_threefold_repetition", 1);
+    float reward_see_hanging   = (float)unpack_kwarg(kwargs, "reward_see_hanging", 0.0);
+    if (reward_see_hanging > 0.0f) reward_see_hanging = 0.0f;  // must be <= 0 (penalty)
     float fen_curric_pct       = (float)unpack_kwarg(kwargs, "fen_curric_pct", 0.0);
 
     /* Parse fen_file string kwarg */
@@ -238,6 +243,10 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         game->reward_material = reward_material;
         game->reward_position = reward_position;
         game->reward_castling = reward_castling;
+        game->reward_draw = reward_draw;
+        game->enable_50_move_rule = enable_50_move_rule;
+        game->enable_threefold_repetition = enable_threefold_repetition;
+        game->reward_see_hanging = reward_see_hanging;
         game->use_curriculum = (fen_curric_pct > 0.0f && vec->fen_count > 0) ? 1 : 0;
         game->obs_stride = obs_stride_bytes;
     }

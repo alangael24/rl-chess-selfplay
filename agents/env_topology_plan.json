@@ -1,0 +1,177 @@
+{
+  "status": "complete",
+  "scope": "env_topology",
+  "analysis": {
+    "current_topology": {
+      "summary": "2 agents per game. Each ChessEnv manages paired White/Black agent slots. PufferLib sees num_agents = num_envs * 2. Both agents receive observations, both submit actions every step. The non-current-player must submit PASS (action 96). Rewards/terminals are mirrored to both slots simultaneously.",
+      "key_details": {
+        "python_env": "chess_env.py:49 sets self.num_agents = num_envs * 2",
+        "c_binding_wiring": "binding.c:212-252 wires game[g] to PufferLib buffer slots [2*g] and [2*g+1] for White/Black",
+        "c_step_both_actions": "chess.h:1850-1981 c_step() reads BOTH actions (white_action=get_action(env,0), black_action=get_action(env,1) at lines 1862-1863), processes current player's action first, then opponent's (should be PASS)",
+        "two_phase_system": "chess.h:1229-1455 process_player_action() handles pick-piece then pick-destination in 2 sub-steps. Action 96 is PASS for the non-active player",
+        "obs_writing": "chess.h:1519-1620 write_observations() writes separate obs for White (env->observations) and Black (env->observations + obs_stride) with board flipping and color swapping for Black",
+        "terminal_sync": "chess.h:1911-1912 both terminals set to 1 simultaneously on game end"
+      },
+      "problems_with_current_approach": [
+        "PufferLib PPO processes all agents in one flat batch. With 2 agents per game, the non-current player emits a PASS action every step, creating ~50% wasted compute (wasted inference, wasted gradient updates on trivial PASS actions).",
+        "LSTM hidden state for the non-active player accumulates PASS observations, corrupting temporal signal.",
+        "The coupling of 2 agent slots per game requires a custom binding.c (not env_binding.h), complicating maintenance.",
+        "GAE/advantage calculation treats the idle agent's zero-reward PASS steps as real timesteps, diluting learning signal.",
+        "Both agents always share the same terminal signal, which is correct for game-end but means PufferLib cannot independently manage episode boundaries per agent."
+      ]
+    },
+    "fighter_topology": {
+      "summary": "The fighter (pufferlib ocean chess) uses the SAME 2-agents-per-game topology. It is NOT a 1-agent-per-env reference. The fighter also has num_agents = num_envs * 2 (chess.py:27), 2 agent slots per game, and reads both actions in c_step (chess.h:859 reads actions[player]).",
+      "key_details": {
+        "python_env": "pufferlib/ocean/chess/chess.py:27 self.num_agents = num_envs * 2",
+        "c_binding": "pufferlib/ocean/chess/binding.c:117 white_idx = 2 * g, same paired wiring",
+        "c_step": "pufferlib/ocean/chess/chess.h:844-951 c_step() reads action = env->actions[player] (only current player's action), does NOT have PASS concept",
+        "simpler_action_space": "4096 actions (from*64+to), no two-phase, no PASS action. Illegal moves get random legal replacement + penalty.",
+        "simpler_obs": "72 bytes (64 board + 8 metadata), no valid_pieces/valid_dests masks"
+      },
+      "key_difference_from_ours": "Fighter reads only actions[player] in c_step (line 859), ignoring the non-active agent's action entirely. There is no PASS action. The non-active player's action is simply thrown away. But both agents still occupy buffer slots and go through PPO."
+    },
+    "proposed_1_agent_per_env_design": {
+      "summary": "Redesign so each env has exactly 1 learning agent. The env internally plays both sides, but only the learner's turn produces obs/actions for the RL loop. The opponent is played internally (e.g., by copying the learner's own policy output, or by a separate opponent mechanism).",
+      "why_not_trivially_possible": "In self-play, both sides need to use the SAME policy. With 1 agent per env, we need the env to somehow invoke the policy for the opponent's turn internally. This requires either: (A) the env plays the opponent internally using a cached/frozen policy (complex, breaks PufferLib's clean separation), or (B) we keep 2 agents per game but restructure how PufferLib processes them to avoid waste.",
+      "recommended_approach": "Keep the 2-agents-per-game architecture but eliminate the PASS action waste. The correct fix is NOT to change to 1-agent-per-env (which would require internal opponent policy execution), but instead to make each agent only step when it is the active player.",
+      "alternative_approaches_considered": [
+        {
+          "name": "True 1-agent-per-env with internal opponent",
+          "description": "Env internally runs the opponent's turn using a frozen policy copy. Only the learner sees obs/makes decisions.",
+          "pros": "Clean 1:1 agent-env mapping. No PASS waste. Standard PufferLib vectorization.",
+          "cons": "Requires running policy inference INSIDE c_step, breaking the C/Python boundary. Or requires multi-step env interaction (step returns after opponent also plays), which means env.step() is variable-latency and the opponent uses a stale policy."
+        },
+        {
+          "name": "2-agents-per-game, eliminate PASS via variable-step",
+          "description": "Instead of both agents stepping every tick, only the active agent steps. The env internally advances through the opponent's turn.",
+          "pros": "Halves inference cost. No wasted PASS actions.",
+          "cons": "Breaks PufferLib's assumption that all agents step synchronously. Would require custom vectorization."
+        },
+        {
+          "name": "2-agents-per-game as-is, accept PASS overhead",
+          "description": "Keep current design. PASS steps are cheap in C but waste policy inference.",
+          "pros": "Simple. Already working. Both agents learn from both perspectives.",
+          "cons": "~50% wasted inference. LSTM hidden state corruption from PASS steps."
+        },
+        {
+          "name": "2-agents-per-game with learner_color alternation",
+          "description": "Keep 2 agent slots, but add a learner_color field that alternates which color the learner plays each episode. The non-learner agent gets a trivially simple policy (random legal or greedy). This is what 'learner_color alternation' means in the fighter context.",
+          "pros": "Learner sees both perspectives. Can use a simpler opponent during early training.",
+          "cons": "Still wastes inference on the opponent agent (unless opponent is handled in C)."
+        }
+      ]
+    }
+  },
+  "assumptions": [
+    "ASSUMPTION-1: PufferLib v3.0 requires all agents to step synchronously (no variable-step per agent). This means we cannot skip the non-active agent's step.",
+    "ASSUMPTION-2: The fighter reference uses the same 2-agents-per-game topology as our implementation. There is no known PufferLib chess env with true 1-agent-per-env self-play.",
+    "ASSUMPTION-3: The PASS action (action 96) is the primary source of waste - approximately 50% of all RL timesteps are PASS steps that contribute no learning signal.",
+    "ASSUMPTION-4: LSTM hidden state is corrupted by PASS observation steps because the obs barely changes between the opponent's move and our next turn, yet the LSTM processes both.",
+    "ASSUMPTION-5: The two-phase action system (pick piece then pick destination) doubles the number of env steps per chess move compared to the fighter's single 4096-action approach, compounding the PASS waste.",
+    "ASSUMPTION-6: Any internal opponent approach (playing opponent inside c_step) would require either calling Python from C or maintaining a separate inference engine in C, both of which are architecturally undesirable."
+  ],
+  "changes": [
+    {
+      "id": "ENV-01",
+      "title": "Remove PASS action - make only active player step",
+      "description": "Restructure c_step to only process the current player's action. The non-active agent's action slot is ignored. This eliminates the need for action 96 (PASS). The action space drops from 97 to 96 (64 squares + 32 promotions).",
+      "files": ["csrc/chess.h"],
+      "current_code": "chess.h:1850-1981 c_step() reads both white_action and black_action, processes both through process_player_action()",
+      "proposed": "c_step() reads only actions[current_player]. Removes PASS handling from process_player_action(). Still writes obs for BOTH agents (so both have fresh state for when their turn comes).",
+      "impact": "Reduces action space from 97 to 96. Eliminates ~50% invalid PASS penalty noise. Simplifies process_player_action() by removing lines 1232-1249.",
+      "risk": "Low. The PASS action never contributed to learning; it was only needed because both agents step simultaneously.",
+      "acceptance": ["No PASS action in action space", "Non-active agent's action ignored", "Both agents still get correct observations"]
+    },
+    {
+      "id": "ENV-02",
+      "title": "Add learner_color alternation per episode",
+      "description": "Add a learner_color field to ChessEnv that determines which color the learner plays this episode. On c_reset, alternate or randomize learner_color. The learner_color agent gets the standard obs; the opponent agent gets a simplified obs or the same obs. This enables asymmetric self-play where one agent is the 'learner' and the other is the 'opponent'.",
+      "files": ["csrc/chess.h", "csrc/binding.c", "chess_env.py"],
+      "current_code": "c_reset at chess.h:1811 always starts with current_player=0 (White), no concept of learner vs opponent",
+      "proposed": "Add int learner_color to ChessEnv. On c_reset: learner_color = (learner_color + 1) % 2 (or random). Both agents still get observations and can act. The trainer can use learner_color to weight rewards or filter experiences.",
+      "impact": "Ensures learner plays both White and Black equally over time. Enables future opponent freezing/strength scaling.",
+      "risk": "Low. Purely additive field. Does not change core game logic.",
+      "acceptance": ["learner_color alternates each episode", "Equal White/Black representation in training data", "Log tracks per-color win rates correctly"]
+    },
+    {
+      "id": "ENV-03",
+      "title": "Restructure observation writing for active-player-only relevance",
+      "description": "Currently write_observations() writes full obs for both White and Black every step. With PASS removed, the non-active agent's obs is only needed when their turn comes. However, since PufferLib reads obs for all agents every step, we must still write both. The change is: ensure the non-active agent's obs clearly indicates 'not my turn' so the policy can learn to output any action (it will be ignored). Remove the pass_valid obs byte (offset 300).",
+      "files": ["csrc/chess.h"],
+      "current_code": "chess.h:1519-1620 write_observations() writes 301-byte obs for both agents including pass_valid at offset 300",
+      "proposed": "Remove pass_valid byte from obs (OBS_SIZE drops from 301 to 300). The side-to-move one-hot (offset 64-65) already tells the agent whose turn it is. Non-active agent's obs still fully written.",
+      "impact": "OBS_SIZE changes from 301 to 300. Minor change to observation parsing in Policy model.",
+      "risk": "Low. pass_valid was redundant with the side-to-move indicator.",
+      "acceptance": ["OBS_SIZE = 300", "No pass_valid in obs", "Policy correctly uses side-to-move to determine active/inactive"]
+    },
+    {
+      "id": "ENV-04",
+      "title": "Update Python env class for new action/obs dimensions",
+      "description": "Update chess_env.py constants and any action-space references to reflect the removal of PASS action (97 -> 96 actions) and removal of pass_valid obs byte (301 -> 300 obs).",
+      "files": ["chess_env.py"],
+      "current_code": "chess_env.py:23-26 OBS_SIZE = 301, NUM_ACTIONS = 97",
+      "proposed": "OBS_SIZE = 300, NUM_ACTIONS = 96",
+      "impact": "All downstream consumers (Policy, train_chess.py) must update to match.",
+      "risk": "Low. Straightforward constant changes.",
+      "acceptance": ["OBS_SIZE = 300 in Python", "NUM_ACTIONS = 96 in Python", "No PASS_ACTION constant needed"]
+    },
+    {
+      "id": "ENV-05",
+      "title": "Update Policy model for removed PASS action and obs byte",
+      "description": "The Policy class in train_chess.py must be updated: (1) NUM_ACTIONS = 96 instead of 97, (2) OBS_SIZE = 300 instead of 301, (3) remove pass_valid from scalar features and action mask, (4) scalar feature size drops from 45 to 44.",
+      "files": ["train_chess.py"],
+      "current_code": "train_chess.py:49 OBS_PASS_VALID = 300, scalar encoder input=45, action mask includes pass_bool at index 96",
+      "proposed": "Remove OBS_PASS_VALID. Scalar encoder input=44. Action mask no longer has slot 96. When it is not the agent's turn (side[0] < 0.5), the policy output is ignored by the env anyway.",
+      "impact": "Slight reduction in model parameters. Cleaner action masking logic.",
+      "risk": "Low. Must ensure the action mask still works correctly for phase 0/phase 1 without PASS.",
+      "acceptance": ["Policy compiles with NUM_ACTIONS=96", "No PASS in action mask", "Training runs without crash"]
+    },
+    {
+      "id": "ENV-06",
+      "title": "Handle non-active agent in PPO - zero-mask or skip",
+      "description": "When an agent is not the active player, its action is ignored by the env. However, PPO still computes loss for that agent's timestep. Two options: (A) zero out the advantage/loss for non-active-player timesteps (requires a mask in the training loop), or (B) accept the overhead since the agent's obs includes 'not my turn' info and the loss is small. Option B is simpler and the recommended starting point.",
+      "files": ["train_chess.py or PufferLib internals"],
+      "current_code": "No special handling; both agents' timesteps contribute equally to PPO loss",
+      "proposed": "Phase 1: Accept overhead (Option B). The agent learns that when side-to-move != self, the optimal action is arbitrary. Phase 2 (future): Add an active_mask to the training buffer that zeros out loss for non-active timesteps.",
+      "impact": "No code change in Phase 1. Phase 2 would require PufferLib training loop modification.",
+      "risk": "Phase 1: Zero risk. Phase 2: Medium, requires PufferLib customization.",
+      "acceptance": ["Phase 1: Training works correctly with both agents stepping", "Phase 2 (future): Non-active timesteps excluded from PPO loss computation"]
+    },
+    {
+      "id": "ENV-07",
+      "title": "Binding.c buffer wiring remains 2-agents-per-game",
+      "description": "The fundamental buffer layout in binding.c (observations[2*i]/[2*i+1], actions[2*i]/[2*i+1], etc.) remains unchanged. The 2-agents-per-game architecture is preserved. Only the C-level step logic changes (ENV-01).",
+      "files": ["csrc/binding.c"],
+      "current_code": "binding.c:1-511 full VecEnv implementation",
+      "proposed": "No structural changes to binding.c. The only change is that c_step now ignores the non-active agent's action, which is internal to chess.h.",
+      "impact": "None to binding.c structure.",
+      "risk": "None.",
+      "acceptance": ["binding.c compiles unchanged", "vec_step still iterates over all games calling c_step"]
+    },
+    {
+      "id": "ENV-08",
+      "title": "Vectorization and batching remain the same",
+      "description": "PufferLib vectorization (pufferlib.vector.make with backend=PufferEnv, num_envs=1) remains unchanged. The PufferEnv still reports num_agents = num_envs * 2. PufferLib batches all 2*N agents into one flat batch for inference.",
+      "files": ["chess_env.py", "train_chess.py"],
+      "current_code": "chess_env.py:49 self.num_agents = num_envs * 2; train_chess.py:237-250 pufferlib.vector.make with num_envs=1, backend=PufferEnv",
+      "proposed": "No change. The vectorization topology is preserved.",
+      "impact": "None.",
+      "risk": "None.",
+      "acceptance": ["pufferlib.vector.make works as before", "num_agents = num_envs * 2"]
+    }
+  ],
+  "implementation_order": [
+    "ENV-01 (remove PASS from c_step - core change)",
+    "ENV-03 (remove pass_valid from obs)",
+    "ENV-04 (update Python constants)",
+    "ENV-05 (update Policy model)",
+    "ENV-02 (add learner_color alternation)",
+    "ENV-06 (PPO handling - Phase 1 is no-op)",
+    "ENV-07 (binding.c - no change needed)",
+    "ENV-08 (vectorization - no change needed)"
+  ],
+  "determinism_guarantee": "Removing PASS does not affect determinism. The game logic (move generation, move application, RNG) is unchanged. The only difference is that the non-active agent's action is ignored instead of validated as PASS.",
+  "self_play_symmetry_guarantee": "Both agents still receive observations with board flipping (Black sees flipped board with swapped colors). Both agents use the same policy. ENV-02 adds learner_color alternation to ensure equal exposure to both sides.",
+  "alternation_policy": "The current_player field in ChessEnv already alternates after each chess move (chess.h:1889). ENV-02 adds a separate learner_color that alternates per episode. These are orthogonal: current_player tracks whose turn it is within a game, learner_color tracks which side the primary learner plays across episodes."
+}

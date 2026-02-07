@@ -1,0 +1,292 @@
+{
+  "status": "complete",
+  "scope": "policy",
+  "assumptions": [
+    "A-POL-01: Observation layout is stable at 301 bytes (CHESS_OBS_SIZE). Any change to C obs layout must bump a version constant and all policies must be updated.",
+    "A-POL-02: Action space is stable at 97 discrete actions (64 squares + 32 promotions + 1 pass). All policies produce logits of shape [B, 97].",
+    "A-POL-03: PufferLib CLI resolves policy via `getattr(env_module.torch, args['policy_name'])`. Ocean envs use `pufferlib/ocean/torch.py`. External envs use `pufferlib/environments/{package}/torch.py`.",
+    "A-POL-04: PufferLib's encode_observations/decode_actions pattern is required for LSTMWrapper compatibility. All policies must implement this interface.",
+    "A-POL-05: The action masking logic is part of the policy (computed in encode_observations, applied in decode_actions). All policies must implement the same masking contract.",
+    "A-POL-06: config/chess.ini `policy_name` field selects the policy class by name. `rnn_name` selects the LSTM wrapper. These are resolved via getattr on the torch module.",
+    "A-POL-07: install_cli.py appends policy code to ocean/torch.py. Multiple policies can coexist as separate classes in this file.",
+    "A-POL-08: Checkpoint compatibility requires matching state_dict keys. Changing policy architecture means new checkpoints; old checkpoints cannot load into architecturally different policies without explicit migration.",
+    "A-POL-09: Two integration paths exist: (1) standalone train_chess.py (imports Policy directly), (2) PufferLib CLI (imports from ocean/torch.py via config). Both must be supported."
+  ],
+  "changes": [
+    {
+      "id": "POL-01",
+      "title": "Define stable policy interface (ObsContract + ActionContract)",
+      "description": "Create a formal interface/base class that all chess policies must implement. This defines the obs->policy and policy->action contracts.",
+      "details": {
+        "interface_spec": {
+          "required_attrs": {
+            "hidden_size": "int - size of hidden representation",
+            "is_continuous": "bool - always False for chess"
+          },
+          "required_methods": {
+            "encode_observations(x, state=None) -> hidden": "Parse 301-byte obs, build action mask, store as self._action_mask, return hidden tensor of shape [B, hidden_size]",
+            "decode_actions(hidden) -> (logits, value)": "Produce logits [B, 97] with action mask applied, value [B, 1]",
+            "forward(x, state=None) -> (logits, value)": "Convenience: calls encode then decode",
+            "forward_eval(x, state=None) -> (logits, value)": "Same as forward (PufferLib convention)"
+          },
+          "obs_parsing_contract": {
+            "board": "x[:, 0:64] - uint8 piece codes (0-12), parsed to board representation",
+            "side": "x[:, 64:66] - one-hot is_my_turn",
+            "castling": "x[:, 66:70] - 4 castling rights",
+            "ep": "x[:, 70:71] - en passant file",
+            "phase": "x[:, 71:73] - one-hot pick_phase (0=piece, 1=dest)",
+            "selected": "x[:, 73:137] - 64-byte selected piece plane",
+            "valid_pieces": "x[:, 137:201] - 64-byte valid piece mask",
+            "valid_dests": "x[:, 201:265] - 64-byte valid dest mask",
+            "valid_promos": "x[:, 265:297] - 32-byte promotion mask",
+            "self_check": "x[:, 297:298]",
+            "opp_check": "x[:, 298:299]",
+            "rule50": "x[:, 299:300]",
+            "pass_valid": "x[:, 300:301]"
+          },
+          "action_mask_contract": "In encode_observations: build self._action_mask [B, 97] bool tensor. Phase 0: mask[:, :64] = valid_pieces. Phase 1: mask[:, :64] = valid_dests, mask[:, 64:96] = valid_promos. mask[:, 96] = pass_valid. In decode_actions: apply mask via masked_fill(~mask, -1e9) with all-masked fallback."
+        },
+        "file": "train_chess.py (standalone) + install_cli.py CHESS_POLICY_CONTENT (CLI)",
+        "risk": "low"
+      },
+      "acceptance": [
+        "All policies implement encode_observations/decode_actions",
+        "All policies correctly parse the 301-byte observation",
+        "All policies produce [B, 97] logits with proper masking",
+        "All policies are LSTMWrapper-compatible"
+      ]
+    },
+    {
+      "id": "POL-02",
+      "title": "Extract shared obs parsing and action masking into a reusable mixin or helper",
+      "description": "The obs parsing (301 bytes -> board, scalars, masks) and action mask building logic is identical across all policies. Extract it into a ChessObsParser helper class or mixin to avoid duplication.",
+      "details": {
+        "approach": "Create a ChessObsMixin or standalone parse_chess_obs() function that all policies can use. This parses raw uint8 obs into named tensors (board, side, castling, etc.) and builds the action mask.",
+        "location": "train_chess.py (top-level helper) and mirrored in install_cli.py CHESS_POLICY_CONTENT",
+        "components": {
+          "parse_obs(x)": "Returns dict of named tensors: board_oh [B,13,8,8], side [B,2], castling [B,4], etc.",
+          "build_action_mask(phase, valid_pieces, valid_dests, valid_promos, pass_valid)": "Returns [B,97] bool mask"
+        },
+        "risk": "low"
+      },
+      "acceptance": [
+        "Helper function exists and is tested",
+        "All policies use the shared parser instead of duplicating obs-slice logic",
+        "Action mask construction is consistent across all policies"
+      ]
+    },
+    {
+      "id": "POL-03",
+      "title": "ChessConvResNet policy (current default, renamed for clarity)",
+      "description": "The current Policy class uses CNN + residual blocks for board encoding + scalar MLP. Rename to ChessConvResNet for the registry and keep as default.",
+      "details": {
+        "architecture_summary": {
+          "board_encoder": "Conv2d(16, 64, 3x3) -> GroupNorm -> 2x ResidualBlock(Conv2d 64->64) -> flatten -> Linear(64*64, 256)",
+          "spatial_input": "13 one-hot piece channels + valid_pieces plane + valid_dests plane + selected plane = 16 channels",
+          "scalar_encoder": "Linear(45, 128) -> ReLU -> Linear(128, 64)",
+          "scalar_input": "side(2) + castling(4) + ep(1) + phase(2) + check(2) + rule50(1) + pass_valid(1) + promos(32) = 45",
+          "fusion": "cat(board_feat[256], scalar_feat[64]) -> Linear(320, 256) -> LayerNorm -> ReLU",
+          "heads": "actor: Linear(256, 97), critic: Linear(256, 1)",
+          "params": "~500K (estimated)"
+        },
+        "config_name": "Chess (backward-compatible alias) or ChessConvResNet",
+        "risk": "low - rename only, architecture unchanged"
+      },
+      "acceptance": [
+        "Existing checkpoints continue to load with both 'Chess' and 'ChessConvResNet' names",
+        "Default config still uses this architecture",
+        "No performance regression"
+      ]
+    },
+    {
+      "id": "POL-04",
+      "title": "ChessNNUE policy architecture",
+      "description": "NNUE-style policy inspired by Stockfish NNUE. Uses piece-on-square feature encoding with efficient sparse input.",
+      "details": {
+        "architecture_concept": {
+          "feature_encoding": "HalfKP-lite: for each (king_square, piece_type, piece_square) triple, compute a feature index. Use nn.EmbeddingBag for sparse-to-dense. ~768 input features (own king sq 64 * 12 piece types = 768 possible features, typically ~16 active).",
+          "layers": "Linear(768, 512) -> ClippedReLU -> Linear(512, 256) -> ClippedReLU -> Linear(256, hidden_size)",
+          "clipped_relu": "min(max(x, 0), 1) - standard NNUE activation",
+          "scalar_path": "Same scalar encoder as ChessConvResNet (45 -> 128 -> 64)",
+          "fusion": "cat(nnue_feat, scalar_feat) -> Linear -> hidden_size",
+          "heads": "Same actor/critic heads",
+          "advantages": "Very fast inference (no convolutions), sparse input, proven effective for chess evaluation",
+          "disadvantages": "Less spatial awareness than CNN, may need more training data"
+        },
+        "config_selection": "policy_name = ChessNNUE in chess.ini",
+        "risk": "medium - new architecture, needs training validation"
+      },
+      "acceptance": [
+        "Policy passes forward/backward with correct shapes",
+        "Trains to at least 50% win rate vs random in 1M steps",
+        "Inference faster than ChessConvResNet (no convolutions)"
+      ]
+    },
+    {
+      "id": "POL-05",
+      "title": "ChessResNet policy architecture (deeper residual tower)",
+      "description": "AlphaZero-lite residual tower with more blocks and larger channel count. For research/scaling experiments.",
+      "details": {
+        "architecture_concept": {
+          "tower": "Conv2d(16, 128, 3x3) -> N ResidualBlocks(128) where N=4,8,16 configurable",
+          "residual_block": "Conv2d(128, 128, 3x3, pad=1) -> BatchNorm -> ReLU -> Conv2d(128, 128, 3x3, pad=1) -> BatchNorm -> skip-add -> ReLU",
+          "policy_head": "Conv2d(128, 2, 1x1) -> BatchNorm -> ReLU -> flatten -> Linear(2*64, 97)",
+          "value_head": "Conv2d(128, 1, 1x1) -> BatchNorm -> ReLU -> flatten -> Linear(64, 256) -> ReLU -> Linear(256, 1) -> tanh",
+          "advantages": "Proven AlphaZero architecture, scalable with depth/width",
+          "disadvantages": "Larger model, slower per-step, needs more compute"
+        },
+        "config_params": {
+          "num_blocks": "4 (default), 8, 16",
+          "channels": "128 (default), 256",
+          "hidden_size": "256"
+        },
+        "config_selection": "policy_name = ChessResNet in chess.ini",
+        "risk": "medium - well-understood architecture but needs tuning"
+      },
+      "acceptance": [
+        "Configurable depth/width via policy config",
+        "Trains successfully with PPO self-play",
+        "Scales GPU utilization appropriately"
+      ]
+    },
+    {
+      "id": "POL-06",
+      "title": "ChessTransformer policy architecture",
+      "description": "Attention-based policy treating board squares as tokens. Experimental.",
+      "details": {
+        "architecture_concept": {
+          "tokenization": "64 board squares -> 64 tokens. Each token = nn.Embedding(13, d_model) + positional encoding (learned or sinusoidal for 8x8 grid)",
+          "encoder": "N transformer encoder layers (d_model=128, nhead=4, dim_ff=512). N=2-4.",
+          "global_token": "Prepend a [CLS] token that aggregates board state. Scalar features injected here.",
+          "policy_head": "Use per-square token outputs for square selection (phase 0/1), [CLS] for value",
+          "action_decoding": "Phase 0: dot(square_tokens, query_vector) -> 64 logits. Phase 1: same for dests + promo head.",
+          "advantages": "Can learn long-range piece interactions, attention maps interpretable",
+          "disadvantages": "More compute per step than CNN, harder to tune, may overfit on small batch"
+        },
+        "config_selection": "policy_name = ChessTransformer in chess.ini",
+        "risk": "high - experimental, may not converge with PPO self-play"
+      },
+      "acceptance": [
+        "Forward/backward passes work",
+        "Attention maps can be extracted for interpretability",
+        "Trains to at least random-beating performance"
+      ]
+    },
+    {
+      "id": "POL-07",
+      "title": "Policy registry system with config-based selection",
+      "description": "Implement a registry that maps policy_name strings to policy classes. Support both CLI (ocean/torch.py) and standalone (train_chess.py) paths.",
+      "details": {
+        "mechanism": {
+          "registry_dict": "CHESS_POLICIES = {'Chess': ChessConvResNet, 'ChessConvResNet': ChessConvResNet, 'ChessNNUE': ChessNNUE, 'ChessResNet': ChessResNet, 'ChessTransformer': ChessTransformer}",
+          "cli_path": "PufferLib resolves via `getattr(ocean.torch, policy_name)`. Each policy class is a top-level name in ocean/torch.py. No special registry needed for CLI - just define the classes.",
+          "standalone_path": "In train_chess.py, add a get_policy(name, env, **kwargs) factory function that looks up CHESS_POLICIES[name]",
+          "config_integration": "chess.ini [base] policy_name = Chess (default). Override with CLI: puffer train puffer_chess --policy-name ChessNNUE",
+          "rnn_wrapper": "Each policy needs a matching LSTM wrapper (or reuse ChessLSTM since LSTMWrapper is generic). config [base] rnn_name = ChessLSTM works for all since LSTMWrapper only needs hidden_size."
+        },
+        "how_to_run_each_policy": {
+          "default": "puffer train puffer_chess  (uses Chess = ChessConvResNet)",
+          "nnue": "puffer train puffer_chess --policy-name ChessNNUE",
+          "resnet": "puffer train puffer_chess --policy-name ChessResNet --policy.num_blocks 8",
+          "transformer": "puffer train puffer_chess --policy-name ChessTransformer",
+          "standalone": "python train_chess.py --policy ChessNNUE"
+        },
+        "risk": "low - builds on existing PufferLib conventions"
+      },
+      "acceptance": [
+        "All four policies loadable via config policy_name",
+        "CLI `puffer train puffer_chess --policy-name X` works for all X",
+        "Standalone `python train_chess.py --policy X` works for all X",
+        "Default (no override) still uses ChessConvResNet"
+      ]
+    },
+    {
+      "id": "POL-08",
+      "title": "Checkpoint compatibility and versioning",
+      "description": "Establish conventions for checkpoint compatibility across policy versions.",
+      "details": {
+        "conventions": {
+          "checkpoint_format": "{'policy_state_dict': state_dict, 'policy_name': str, 'obs_version': int, 'config': dict}",
+          "obs_version": "Integer version of the observation layout. Currently v1 (301 bytes). Bumped whenever obs layout changes.",
+          "policy_name_in_checkpoint": "Store the policy class name so loaders know which architecture to instantiate",
+          "strict_loading": "Use strict=True by default. If obs_version mismatches, error with clear message.",
+          "migration_path": "When obs layout changes: (1) bump obs_version, (2) provide a migrate_checkpoint(old_ckpt, new_obs_version) utility if feasible, (3) document in CHANGELOG"
+        },
+        "cross_policy_notes": "Checkpoints are NOT compatible across different policy architectures (different state_dict keys). A ChessConvResNet checkpoint cannot load into ChessNNUE. This is by design - each architecture has its own training trajectory.",
+        "risk": "low - convention only, no code changes needed now"
+      },
+      "acceptance": [
+        "Checkpoint save includes policy_name and obs_version",
+        "Load code validates obs_version match",
+        "Clear error message if architecture mismatch"
+      ]
+    },
+    {
+      "id": "POL-09",
+      "title": "Update install_cli.py to register all policy classes",
+      "description": "The install_cli.py CHESS_POLICY_CONTENT string must include all policy classes so they are available in ocean/torch.py for CLI usage.",
+      "details": {
+        "current_state": "install_cli.py appends Chess + ChessLSTM classes to ocean/torch.py",
+        "proposed_change": "Extend CHESS_POLICY_CONTENT to include all four architectures: Chess (alias ChessConvResNet), ChessNNUE, ChessResNet, ChessTransformer, plus ChessLSTM wrapper (works for all).",
+        "ordering": "Helper functions first (parse_obs, build_mask), then each policy class, then LSTM wrapper, then registry dict at bottom.",
+        "risk": "low"
+      },
+      "acceptance": [
+        "After python install_cli.py, all four policies are importable from ocean/torch.py",
+        "puffer train puffer_chess --policy-name X works for all X in {Chess, ChessNNUE, ChessResNet, ChessTransformer}"
+      ]
+    },
+    {
+      "id": "POL-10",
+      "title": "Update standalone train_chess.py with policy selection",
+      "description": "Add --policy CLI argument to train_chess.py for standalone training with any registered policy.",
+      "details": {
+        "current_state": "train_chess.py hard-codes Policy class instantiation",
+        "proposed_change": "Add argparse --policy flag (default='Chess'). Use CHESS_POLICIES registry to instantiate. All policies defined in same file.",
+        "example": "python train_chess.py --policy ChessNNUE --hidden-size 512",
+        "risk": "low"
+      },
+      "acceptance": [
+        "python train_chess.py uses ChessConvResNet by default",
+        "python train_chess.py --policy ChessNNUE uses NNUE",
+        "Unknown policy name gives clear error"
+      ]
+    }
+  ],
+  "pufferlib_conventions_analysis": {
+    "how_cli_resolves_policy": "1. Config .ini [base] has policy_name='Chess'. 2. pufferl.load_policy() does `getattr(env_module.torch, policy_name)` where env_module is pufferlib.ocean. 3. This looks up the class name in ocean/torch.py. 4. If rnn_name is set, wraps with `getattr(env_module.torch, rnn_name)`. 5. Policy kwargs come from [policy] section, rnn kwargs from [rnn] section.",
+    "ocean_torch_py_pattern": "All ocean env policies live in a single file: pufferlib/ocean/torch.py. Each env's policies are separate classes (e.g., MOBA, Snake, Go, Chess). Policy classes follow encode_observations/decode_actions pattern.",
+    "external_env_pattern": "External envs (atari, crafter, etc.) have their own torch.py in pufferlib/environments/{package}/torch.py.",
+    "our_integration": "We use ocean path via install_cli.py which appends to ocean/torch.py. This means all policy classes must be defined in the CHESS_POLICY_CONTENT string literal in install_cli.py.",
+    "convention_notes": [
+      "Policy __init__ takes (env, **kwargs) where env is the driver_env (has single_observation_space, single_action_space)",
+      "encode_observations and decode_actions are the split points for LSTM wrapping",
+      "hidden_size attribute must match LSTM input_size",
+      "is_continuous = False for discrete action spaces",
+      "PufferLib's sample_logits() handles discrete logits -> action sampling"
+    ]
+  },
+  "current_architecture_analysis": {
+    "policy_class": "Policy (in train_chess.py, line 66)",
+    "lstm_wrapper": "ChessLSTM (in train_chess.py, line 196) - thin wrapper around pufferlib.models.LSTMWrapper",
+    "instantiation": "base_policy = Policy(vecenv, hidden_size=256, num_blocks=2); policy = ChessLSTM(vecenv, base_policy, 256, 256).to(device)",
+    "observation_flow": "301 uint8 bytes -> parse into board(64), side(2), castling(4), ep(1), phase(2), selected(64), valid_pieces(64), valid_dests(64), valid_promos(32), checks(2), rule50(1), pass(1) -> board one-hot 13ch + 3 spatial planes -> CNN -> flatten -> Linear(4096, 256) -> concat with scalar(45->64) -> fusion Linear(320, 256) -> hidden",
+    "action_flow": "hidden -> Linear(256, 97) -> mask with stored _action_mask -> logits; Linear(256, 1) -> value",
+    "parameter_count": "~500K parameters (estimate: conv 16*64*9=9K, 2 res blocks 2*2*64*64*9=73K, proj 4096*256=1M, scalar 45*128+128*64=14K, fusion 320*256=82K, actor 256*97=25K, critic 256=256)",
+    "key_design_decisions": [
+      "GroupNorm(8, 64) instead of BatchNorm - works with variable batch sizes",
+      "Residual blocks with pre-activation pattern",
+      "Action masking computed during encode_observations, stored as instance variable, applied during decode_actions",
+      "Batch size mismatch handling for LSTM training (B*T reshaping)"
+    ]
+  },
+  "fighter_vs_ours_comparison": {
+    "fighter_obs": "72 bytes: 64 board + 8 metadata (is_my_turn, 4 castling, ep, halfmove, fullmove)",
+    "our_obs": "301 bytes: 64 board + 237 metadata (includes phase, masks, selected piece, checks, promos, pass_valid)",
+    "fighter_actions": "4096 (from*64 + to), single-phase, illegal moves get random replacement",
+    "our_actions": "97, two-phase (pick piece then pick dest), action masking, no random replacement",
+    "fighter_policy": "Embedding(13,32) -> MLP residual blocks (no CNN) -> Linear(hidden, 4096). Defined in ocean/torch.py class Chess.",
+    "our_policy": "One-hot(13) -> CNN + residual -> Linear + scalar path -> fusion -> Linear(hidden, 97). Defined in train_chess.py class Policy.",
+    "key_difference": "Fighter uses embedding + MLP (no spatial awareness). We use CNN + spatial planes (better for positional play). Fighter has 4096 action space, we have 97 with two-phase masking."
+  }
+}

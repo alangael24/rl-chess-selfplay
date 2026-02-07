@@ -1,0 +1,157 @@
+{
+  "status": "complete",
+  "scope": "logging",
+  "assumptions": [
+    "A-LOG-01: PufferLib v3.0 PuffeRL is the train loop; it calls env.step() which returns info dicts via vec_log(). PuffeRL collects these into self.stats and logs them as 'environment/<key>' to WandB/Neptune/dashboard.",
+    "A-LOG-02: PuffeRL checkpoints every checkpoint_interval epochs via save_checkpoint(). It saves model weights only (uncompiled_policy.state_dict()) plus optimizer state. There is NO composite scoring or best-model selection -- every Nth epoch is saved unconditionally.",
+    "A-LOG-03: SPS and performance profiling (env time, forward time, train time, etc.) are handled entirely by PuffeRL's Profile class. The env does not need to supply these.",
+    "A-LOG-04: Our env's vec_log() is called every report_interval ticks (default 128). It aggregates across all games, averages by completed episodes (n), resets accumulators, and returns a flat dict.",
+    "A-LOG-05: Fighter uses the same PuffeRL train loop and vec_log() pattern -- the only difference is what fields the C Log struct contains and what the binding exports.",
+    "A-LOG-06: Reward clipping to [-1, 1] happens in PuffeRL evaluate() (torch.clamp(r, -1, 1)), so env-side reward magnitude is capped."
+  ],
+  "changes": [
+    {
+      "id": "LOG-01",
+      "title": "Add timeout_rate to Log struct and vec_log export",
+      "scope": "csrc/chess.h, csrc/binding.c",
+      "description": "Track games that end by max_steps truncation separately from draw endings. Add 'float timeout_rate' to Log struct. In c_step(), when step_count >= max_steps triggers truncation, increment log.timeouts += 1 (alongside log.draws). In vec_log(), export timeout_rate = agg.timeouts * inv_n. This distinguishes actual drawn games from games that simply ran out of steps.",
+      "acceptance": "vec_log dict includes 'timeout_rate' float in [0,1]. Games ending by checkmate/stalemate/fifty-move/repetition/insufficient do NOT increment timeouts. Only max_steps truncation increments timeouts.",
+      "priority": "high",
+      "rationale": "Critical training signal: high timeout_rate means games are too long for max_steps, indicating policy isn't learning to finish games. Needed for composite checkpoint scoring."
+    },
+    {
+      "id": "LOG-02",
+      "title": "Add game_length_score derived metric",
+      "scope": "csrc/binding.c (vec_log function)",
+      "description": "Compute game_length_score as a derived metric in vec_log(). Formula: game_length_score = chess_moves / episode_length (ratio of actual chess moves to total env steps). This measures action efficiency -- how often the agent makes a real chess move vs wasting steps on invalid actions/passes. Already have both raw values (chess_moves, episode_length) so this is purely a derived computation in vec_log().",
+      "acceptance": "vec_log dict includes 'game_length_score' float. Value is chess_moves / episode_length when episode_length > 0, else 0. A score near 0.5 means approximately one chess move per 2 env steps (one per player per step).",
+      "priority": "medium",
+      "rationale": "Measures action efficiency. In a perfect game with no invalid actions, this should approach ~0.5 (one chess move per 2 agent-steps per env step since there are 2 agents). Low values indicate wasted computation on invalid actions."
+    },
+    {
+      "id": "LOG-03",
+      "title": "Add end_type breakdown metrics",
+      "scope": "csrc/chess.h, csrc/binding.c",
+      "description": "Currently we track white_wins, black_wins, draws, repetitions, and derive draw_rate. Add explicit per-end-type counters to Log: checkmates (already implicit in white_wins + black_wins), stalemates, fifty_move, insufficient, timeouts. In c_step(), increment the appropriate counter based on the GAME_* result code. In vec_log(), export checkmate_rate, stalemate_rate, fifty_move_rate, timeout_rate (all averaged by n).",
+      "acceptance": "vec_log dict includes 'checkmate_rate', 'stalemate_rate', 'fifty_move_rate', 'timeout_rate' floats. Sum of checkmate_rate + stalemate_rate + fifty_move_rate + timeout_rate + insufficient_rate should equal 1.0 (within floating-point tolerance).",
+      "priority": "medium",
+      "rationale": "Detailed game ending breakdown reveals training dynamics. High stalemate_rate may indicate the agent learns to avoid checkmate but not to win. High fifty_move_rate suggests the agent shuffles pieces without progress."
+    },
+    {
+      "id": "LOG-04",
+      "title": "Add composite checkpoint scoring",
+      "scope": "chess_env.py or train_chess.py (Python-side)",
+      "description": "Implement a composite score for checkpoint selection. Formula: composite_score = 0.4 * decisive_rate + 0.3 * (1 - invalid_action_rate) + 0.2 * chess_efficiency + 0.1 * (1 - timeout_rate), where decisive_rate = (white_wins + black_wins), chess_efficiency = chess_moves / episode_length. This score is computed from vec_log() dict fields in Python. Add a 'best_score' tracker that saves an additional 'best_model.pt' whenever composite_score exceeds the previous best. This requires a small wrapper around PuffeRL's checkpointing or a post-train-step hook.",
+      "acceptance": "When running train_chess.py standalone, a best_model.pt is saved whenever the composite score improves. The composite_score is logged as a metric. All component scores are also logged individually.",
+      "priority": "high",
+      "rationale": "PuffeRL saves every Nth checkpoint blindly. A composite score that weights decisive games, action validity, efficiency, and game completion ensures the best checkpoint is preserved. Fighter has no such mechanism either, so this is an improvement over both."
+    },
+    {
+      "id": "LOG-05",
+      "title": "Add material_at_end and endgame detection metric",
+      "scope": "csrc/chess.h",
+      "description": "Already tracking material_score in Log (White material - Black material at game end). Add an additional metric: total_material_at_end = compute_material_score(env, 0) + compute_material_score(env, 1). This indicates whether games reach endgame (low total material) or end quickly with all pieces. Currently material_score only captures the difference. The sum captures the total. Add 'float total_material_at_end' to Log struct, compute in each game-end block.",
+      "acceptance": "vec_log dict includes 'total_material_at_end' float (averaged across episodes). Starting total material is ~7880 centipawns (2*3920). Values below ~3000 suggest games reaching endgame phase.",
+      "priority": "low",
+      "rationale": "Tracks whether the agent learns to trade pieces and reach endgames vs ending games early. Useful diagnostic but not critical for training."
+    },
+    {
+      "id": "LOG-06",
+      "title": "Ensure all existing metrics are correctly exported",
+      "scope": "csrc/binding.c",
+      "description": "Verify and document the complete list of currently exported metrics from vec_log(). Current fields: episode_length, episode_return, white_wins, black_wins, draws, illegal_moves, material_score, positional_score, invalid_action_rate, draw_rate, white_winrate, black_winrate, score, chess_moves, repetitions, n. These are all correctly exported. No change needed, but document the complete field list for reference.",
+      "acceptance": "No code change. This is a documentation/verification item. All 16 fields listed above are confirmed present and correctly computed.",
+      "priority": "informational",
+      "rationale": "Baseline documentation for the logging system."
+    },
+    {
+      "id": "LOG-07",
+      "title": "Add optional WandB/Neptune logger integration to standalone train_chess.py",
+      "scope": "train_chess.py",
+      "description": "The standalone train_chess.py currently uses NoLogger (no external logging). Add CLI args --wandb and --wandb-project to enable WandB logging when running standalone. This mirrors what PuffeRL CLI already supports. Import WandbLogger from pufferlib.pufferl and pass it as the logger kwarg to PuffeRL constructor. All environment/* and losses/* metrics will then be automatically logged.",
+      "acceptance": "Running 'python3 train_chess.py --wandb --wandb-project chess-selfplay' creates a WandB run that logs all environment metrics (episode_length, white_wins, score, etc.) and loss metrics (policy_loss, value_loss, entropy, etc.). Running without --wandb uses NoLogger as before.",
+      "priority": "medium",
+      "rationale": "External logging is essential for comparing runs, tracking training curves, and sharing results. The CLI path (puffer train puffer_chess --wandb) already supports this, but the standalone path should too."
+    },
+    {
+      "id": "LOG-08",
+      "title": "Add Elo-vs-random periodic evaluation",
+      "scope": "train_chess.py or new callback",
+      "description": "Periodically (e.g., every 50 checkpoint_intervals or N epochs) run a quick Elo evaluation against a random baseline using the existing eval_elo.py machinery. Save the Elo estimate as a logged metric. This could be implemented as a periodic callback after save_checkpoint, spawning a short eval_elo run (e.g., 50 games) with the current policy weights. The Elo metric is then appended to the WandB/Neptune log.",
+      "acceptance": "A metric 'elo_vs_random' appears in the training logs at periodic intervals. The metric uses the same Elo computation as eval_elo.py. Must not significantly slow down training (run eval in a background thread or only every ~50 checkpoints).",
+      "priority": "low",
+      "rationale": "Elo-vs-random is the ground truth measure of playing strength. Self-play metrics (winrate, score) can be misleading because both players improve together. Periodic Elo gives an absolute strength estimate. However, this is expensive and can be deferred."
+    }
+  ],
+  "analysis": {
+    "fighter_vs_ours_log_comparison": {
+      "fighter_log_struct_fields": [
+        "episode_length",
+        "episode_return",
+        "white_wins",
+        "black_wins",
+        "draws",
+        "illegal_moves",
+        "n"
+      ],
+      "our_log_struct_fields": [
+        "episode_length",
+        "episode_return",
+        "white_wins",
+        "black_wins",
+        "draws",
+        "illegal_moves",
+        "material_score",
+        "positional_score",
+        "invalid_action_rate",
+        "chess_moves",
+        "repetitions",
+        "n"
+      ],
+      "our_derived_fields_in_vec_log": [
+        "draw_rate (= draws averaged)",
+        "white_winrate (= white_wins averaged)",
+        "black_winrate (= black_wins averaged)",
+        "score (= white_winrate + 0.5 * draw_rate)"
+      ],
+      "fields_we_have_that_fighter_lacks": [
+        "material_score - net material advantage at game end",
+        "positional_score - net positional score at game end",
+        "invalid_action_rate - fraction of steps with invalid actions",
+        "chess_moves - average chess moves per episode",
+        "repetitions - fraction of games ending in repetition",
+        "draw_rate, white_winrate, black_winrate, score - derived convenience fields"
+      ],
+      "fields_fighter_has_that_we_lack": "NONE - we are a strict superset of fighter's logging"
+    },
+    "aggregation_mechanism": {
+      "description": "Both fighter and our env use the same pattern: Log struct fields are summed across games in vec_log(), then divided by total n (number of completed episodes). Per-game accumulators are zeroed after aggregation. This means metrics represent averages over all episodes completed since the last vec_log() call.",
+      "cadence": "vec_log() is called every report_interval ticks (default 128) from Python env.step(). PuffeRL then further averages over the eval phase and logs every ~0.25 seconds.",
+      "per_episode_vs_per_batch": "Per-episode. Each game-end block increments log.n by 1 and adds to accumulators. vec_log averages by n. If no episodes complete in an interval, vec_log returns empty dict (n==0 check)."
+    },
+    "checkpoint_mechanism": {
+      "pufferl_behavior": "PuffeRL.save_checkpoint() is called every checkpoint_interval epochs. It saves model weights (uncompiled_policy.state_dict()) and optimizer state. Model files are named model_NNNNNN.pt. There is NO score-based selection -- every Nth checkpoint is saved unconditionally.",
+      "our_standalone_behavior": "train_chess.py standalone saves chess_selfplay.pt at the very end (after training completes). It does NOT save periodic checkpoints unless using PuffeRL's checkpoint_interval.",
+      "fighter_behavior": "Same as PuffeRL -- no composite scoring, periodic saves only.",
+      "gap": "No best-model selection. All checkpoints are equally weighted. LOG-04 addresses this."
+    },
+    "performance_metrics": {
+      "sps": "Computed by PuffeRL as (global_step - last_log_step) / (time - last_log_time). Logged as 'SPS' in the main logs. The env does NOT need to provide this.",
+      "env_time": "Tracked by PuffeRL Profile class under 'env' key. Measures wall-clock time in vecenv.recv() + vecenv.send(). Logged as 'performance/env'.",
+      "forward_time": "Tracked as 'eval_forward' and 'train_forward' by PuffeRL Profile. Logged as 'performance/eval_forward' and 'performance/train_forward'.",
+      "utilization": "CPU%, GPU%, DRAM%, VRAM% tracked by PuffeRL Utilization thread. Displayed on dashboard but NOT logged to WandB/Neptune (dashboard-only).",
+      "gap": "Performance metrics are fully handled by PuffeRL. No env-side changes needed."
+    },
+    "wandb_tensorboard_integration": {
+      "wandb": "PuffeRL supports WandbLogger. All fields from mean_and_log() are sent: SPS, agent_steps, uptime, epoch, learning_rate, environment/*, losses/*, performance/*. The environment/* fields come from our vec_log() dict.",
+      "neptune": "PuffeRL supports NeptuneLogger with identical field set.",
+      "tensorboard": "NOT supported natively by PuffeRL v3.0. Would need a custom logger class.",
+      "standalone_gap": "train_chess.py standalone uses NoLogger. LOG-07 addresses adding WandB support."
+    },
+    "elo_evaluation": {
+      "current": "eval_elo.py is a standalone script that loads checkpoints and plays matches. It supports: random vs random, checkpoint vs random, checkpoint vs checkpoint. Uses play_match() which creates a Chess env and runs greedy (argmax) play. Computes Elo from win rates.",
+      "integration_gap": "eval_elo.py is not integrated into the training loop. It must be run manually after training. LOG-08 proposes periodic in-training Elo evaluation.",
+      "fighter_comparison": "Fighter has no built-in Elo evaluation either. Our eval_elo.py is an advantage."
+    }
+  }
+}

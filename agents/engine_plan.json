@@ -1,0 +1,322 @@
+{
+  "status": "complete",
+  "scope": "engine",
+  "summary": "Comparative analysis of our chess.h (1988 lines, two-phase action, rich reward shaping) vs fighter chess.h (958 lines, single-phase from*64+to action, minimal reward). Our engine is a significant superset of fighter. The fighter is simpler but both share the same core approach: array-based board[64], loop-based pseudo-legal movegen + legality filter, loop-based is_square_attacked. Neither uses bitboards or magic numbers. The primary gaps are: (1) our position hash is weak XOR vs proper Zobrist, (2) we lack find_king caching, (3) no bitboard-based attack maps in either engine. Since the fighter ALSO uses the array/loop approach, the gap is smaller than expected.",
+
+  "assumptions": [
+    "ASSUMPTION-1: Fighter does NOT use bitboards. Both engines use int8_t board[64] array representation with loop-based move generation. The fighter is not a bitboard engine.",
+    "ASSUMPTION-2: Fighter does NOT use Zobrist hashing. The fighter has no position hashing or repetition detection at all (no GAME_REPETITION code).",
+    "ASSUMPTION-3: Fighter does NOT use magic attack tables. Both engines use identical ray-scanning loops for sliders (bishop/rook/queen).",
+    "ASSUMPTION-4: Fighter has no legal move caching. Our engine adds a cache keyed by position hash.",
+    "ASSUMPTION-5: Fighter has no FEN parser. Our engine supports FEN-based curriculum learning.",
+    "ASSUMPTION-6: Fighter has no SEE (Static Exchange Evaluation). Our engine has a full SEE implementation.",
+    "ASSUMPTION-7: Fighter has no reward shaping. It uses only win/loss/draw +1/-1/0 plus illegal_move_penalty and step_penalty.",
+    "ASSUMPTION-8: Fighter uses single-phase action (from*64+to = 4096 actions). Our engine uses two-phase (97 actions: pick piece then pick destination).",
+    "ASSUMPTION-9: Fighter's obs is 72 bytes (64 board + 8 metadata). Our obs is 301 bytes with validity masks.",
+    "ASSUMPTION-10: Fighter auto-queens all promotions. Our engine supports explicit underpromotion via action encoding.",
+    "ASSUMPTION-11: Fighter resets logs per-episode (log.x = value). Our engine accumulates across episodes (log.x += value) with log.n counter."
+  ],
+
+  "changes": [
+    {
+      "id": "ENG-01",
+      "priority": "P0",
+      "title": "Replace weak XOR hash with Zobrist hashing",
+      "description": "Our compute_position_hash (lines 571-581) uses a weak XOR-shift scheme: hash ^= board[i] << ((i%8)*8) ^ board[i] << ((i/8)*7). This produces collisions at non-trivial rates, which poisons our threefold repetition detection and legal move cache. Replace with proper Zobrist hashing: pre-computed random 64-bit keys for each (piece, square) pair plus keys for castling rights, en passant file, and side to move. Update hash incrementally in apply_move_ex instead of recomputing from scratch each time.",
+      "files_affected": [
+        "csrc/chess.h:571-581 (compute_position_hash)",
+        "csrc/chess.h:584-589 (record_position_hash)",
+        "csrc/chess.h:592-606 (count_position_occurrences, check_threefold_repetition)",
+        "csrc/chess.h:1000-1024 (generate_legal_moves_cached - uses hash as cache key)",
+        "csrc/chess.h:1028-1049 (has_any_legal_move - uses hash as cache key)",
+        "csrc/chess.h:1058-1149 (apply_move_ex - add incremental hash updates)"
+      ],
+      "acceptance_criteria": [
+        "Zobrist table: static uint64_t ZOBRIST_PIECE[13][64], ZOBRIST_CASTLE[16], ZOBRIST_EP[8], ZOBRIST_SIDE initialized from a fixed PRNG seed",
+        "Incremental update: apply_move_ex XORs out moved piece from old square, XORs in piece at new square, updates castling/ep/side keys",
+        "ChessEnv gains a uint64_t zobrist_hash field, updated incrementally",
+        "compute_position_hash becomes a full-board recompute (fallback/init only), used in c_reset",
+        "position_history stores incrementally-maintained hash values",
+        "Perft test: run perft(1..5) from starting position and several known FEN positions, verify move counts match known values (proves hash does not break move generation or game state)",
+        "Collision test: play 10000 random games, verify zero false repetition detections by cross-checking with a from-scratch hash recompute",
+        "Legal move cache test: verify cache hit rate > 90% during normal play (incremental hash matches recomputed hash)"
+      ],
+      "effort_estimate": "Medium (2-4 hours)",
+      "dependencies": [],
+      "notes": "Fighter has NO hashing at all - it doesn't detect threefold repetition (no GAME_REPETITION constant). Our engine already tracks repetition; we just need a better hash. The Zobrist approach is standard and well-understood. Key decisions: (a) use a compile-time PRNG seed for reproducibility, (b) store hash in ChessEnv struct, (c) update in apply_move_ex for all board changes including castling rook moves and en passant captures."
+    },
+    {
+      "id": "ENG-02",
+      "priority": "P0",
+      "title": "Cache king square positions to avoid linear scans",
+      "description": "find_king (lines 693-699) does a linear scan of all 64 squares every call. It is called from is_in_check, which is called from: is_move_legal (per pseudo-legal move), check_game_end, write_observations (4 times for both players' check status), and process_player_action. In a typical step with ~30 pseudo-legal moves, find_king may be called 60+ times. Add king_sq[2] to ChessEnv (indexed by player) and maintain it incrementally in apply_move_ex when a king moves.",
+      "files_affected": [
+        "csrc/chess.h:97-158 (ChessEnv struct - add king_sq[2])",
+        "csrc/chess.h:693-699 (find_king - use cached value)",
+        "csrc/chess.h:1058-1149 (apply_move_ex - update king_sq on king moves)",
+        "csrc/chess.h:1626-1658 (setup_initial_board - set king_sq[0]=4, king_sq[1]=60)",
+        "csrc/chess.h:1666-1784 (setup_from_fen - scan and set king_sq after parsing)",
+        "csrc/chess.h:1811-1848 (c_reset - set king_sq)"
+      ],
+      "acceptance_criteria": [
+        "find_king returns env->king_sq[player] in O(1) without any loop",
+        "king_sq updated correctly after king moves, including castling (e.g., 4->6 for white kingside)",
+        "Perft test: all perft counts unchanged after this change",
+        "Assertion: in debug builds, verify find_king_scan(env, player) == env->king_sq[player] after every move"
+      ],
+      "effort_estimate": "Small (30 min - 1 hour)",
+      "dependencies": [],
+      "notes": "Fighter also does linear scan for find_king (lines 260-266), so this is not a parity issue but a clear performance win. The two-phase action system means we call find_king much more often than fighter does."
+    },
+    {
+      "id": "ENG-03",
+      "priority": "P1",
+      "title": "Pre-compute piece lists to avoid full-board scans in movegen",
+      "description": "generate_pseudo_legal_moves (lines 721-918) iterates all 64 squares and checks is_own_piece for each. In a typical midgame position, only ~16 of 64 squares have our pieces. Maintain piece lists: for each player, an array of (square, piece_type) pairs and a count. Update incrementally in apply_move_ex on moves, captures, promotions. This cuts the outer loop from 64 iterations to ~16.",
+      "files_affected": [
+        "csrc/chess.h:97-158 (ChessEnv struct - add piece list arrays)",
+        "csrc/chess.h:721-918 (generate_pseudo_legal_moves - iterate piece list instead of board)",
+        "csrc/chess.h:1058-1149 (apply_move_ex - update piece lists on move/capture/promotion)",
+        "csrc/chess.h:1626-1658 (setup_initial_board - populate piece lists)",
+        "csrc/chess.h:1666-1784 (setup_from_fen - populate piece lists)",
+        "csrc/chess.h:1811-1848 (c_reset - populate piece lists)"
+      ],
+      "acceptance_criteria": [
+        "Piece lists correctly maintained through all move types: normal, capture, en passant, castling, promotion",
+        "generate_pseudo_legal_moves iterates only over own pieces, not all 64 squares",
+        "Perft test: all perft counts unchanged",
+        "compute_material_score and compute_positional_score can also use piece lists for O(n_pieces) instead of O(64)"
+      ],
+      "effort_estimate": "Medium (2-3 hours)",
+      "dependencies": [],
+      "notes": "Fighter also scans all 64 squares (line 292). This is an improvement beyond fighter parity. The tricky part is correctly handling all the edge cases in apply_move_ex: en passant removes a pawn from a different square than to_sq; castling moves a rook; promotion changes piece type. Need careful bookkeeping."
+    },
+    {
+      "id": "ENG-04",
+      "priority": "P1",
+      "title": "Optimize is_move_legal with pinned-piece detection",
+      "description": "is_move_legal (lines 921-977) does make-move / is_in_check / unmake-move for every pseudo-legal move. is_in_check calls find_king + is_square_attacked (which scans all attack directions). For ~30 pseudo-legal moves, this is ~30 make/unmake cycles with full attack detection each time. Optimization: (1) with king_sq cached (ENG-02), save one scan; (2) compute pinned pieces mask before the loop - a piece is pinned if it lies on a line between own king and an enemy slider. Non-pinned, non-king pieces that don't touch the king's line can skip the legality check entirely. King moves still need full check. En passant needs special handling (discovered check through the captured pawn's rank).",
+      "files_affected": [
+        "csrc/chess.h:921-977 (is_move_legal)",
+        "csrc/chess.h:980-996 (generate_legal_moves - could integrate pin detection)",
+        "csrc/chess.h:1028-1049 (has_any_legal_move)"
+      ],
+      "acceptance_criteria": [
+        "Compute pinned pieces set once before iterating pseudo-legal moves",
+        "Non-king, non-pinned piece moves skip the make/unmake legality check",
+        "Pinned piece moves only need to verify they stay on the pin line",
+        "King moves still do full is_square_attacked check",
+        "En passant moves always do full legality check (horizontal pin edge case)",
+        "Perft test: all perft counts unchanged",
+        "Benchmark: measure movegen time before and after on 1000 random positions"
+      ],
+      "effort_estimate": "Large (3-5 hours)",
+      "dependencies": ["ENG-02"],
+      "notes": "This is a significant optimization that neither engine currently has. The make/unmake approach is correct but slow. A pinned-piece pre-computation can eliminate 70-80% of legality checks. This is a step towards more sophisticated move generation without going full bitboard."
+    },
+    {
+      "id": "ENG-05",
+      "priority": "P1",
+      "title": "Optimize is_square_attacked with early-exit and attack-from tables",
+      "description": "is_square_attacked (lines 613-690) checks all 6 attack types sequentially. For legality checking during movegen, we only need to know if the king square is attacked. Optimizations: (1) Reorder attack checks by likelihood (knights and pawns first - they're the most common checks); (2) Use precomputed ATTACK_FROM[64][64] lookup: for any pair of squares, store whether an attack ray exists and what piece type could attack along it. This turns slider attack checks from ray-scanning loops into O(1) lookups when checking specific attacker squares.",
+      "files_affected": [
+        "csrc/chess.h:613-690 (is_square_attacked)"
+      ],
+      "acceptance_criteria": [
+        "Attack detection produces identical results for all positions",
+        "Measurable speedup in perft benchmarks (target: 20-30% faster)",
+        "Perft test: all counts unchanged"
+      ],
+      "effort_estimate": "Medium (2-3 hours)",
+      "dependencies": [],
+      "notes": "Both engines have identical is_square_attacked implementations. This optimization helps both but is more impactful for our engine due to the two-phase system calling it more frequently. An ATTACK_FROM table would be 64*64=4096 bytes - very cache-friendly."
+    },
+    {
+      "id": "ENG-06",
+      "priority": "P2",
+      "title": "Add bitboard-based attack maps for long-term performance",
+      "description": "Both engines currently use loop-based ray scanning for slider attacks. The ultimate performance ceiling requires bitboard representation: uint64_t per piece type, with magic number-based attack generation for bishops and rooks. This would replace the inner loops in generate_pseudo_legal_moves and is_square_attacked with O(1) bitboard operations. This is a large structural change.",
+      "files_affected": [
+        "csrc/chess.h (nearly all move generation and attack detection functions)"
+      ],
+      "acceptance_criteria": [
+        "Bitboard representation coexists with or replaces board[64] array",
+        "Magic attack tables for bishops and rooks",
+        "Precomputed knight and king attack tables (64-entry uint64_t arrays)",
+        "Pawn attack tables (2*64 entries for white/black)",
+        "generate_pseudo_legal_moves uses bitboard iteration",
+        "is_square_attacked uses bitboard attack maps",
+        "Perft test: all counts unchanged",
+        "Benchmark: 3-5x speedup over current implementation in perft"
+      ],
+      "effort_estimate": "Very Large (1-2 weeks)",
+      "dependencies": ["ENG-01", "ENG-02", "ENG-03", "ENG-04"],
+      "notes": "This is a P2 because fighter does NOT use bitboards either, so it's beyond parity. However, it's the standard approach for high-performance chess engines and would provide the largest performance gain. Should only be attempted after P0/P1 items are done and profiled. Could adapt an existing bitboard implementation (e.g., from Stockfish) for the attack tables."
+    },
+    {
+      "id": "ENG-07",
+      "priority": "P0",
+      "title": "Add comprehensive perft test suite",
+      "description": "Neither engine has a perft test. Perft (performance test, move path enumeration) is the gold standard for chess move generation correctness. Implement a perft function and test harness that verifies move counts from multiple known positions at multiple depths. This is prerequisite to safely making any engine changes.",
+      "files_affected": [
+        "New file: csrc/test_perft.c or tests/test_perft.c",
+        "csrc/chess.h (add perft function, possibly inline)"
+      ],
+      "acceptance_criteria": [
+        "perft(depth, env) recursively counts leaf nodes at given depth",
+        "Test positions include: starting position (perft 1-5), Kiwipete, position 3-6 from chess programming wiki",
+        "Starting position perft values: depth 1=20, 2=400, 3=8902, 4=197281, 5=4865609",
+        "All known perft positions pass",
+        "Can be run as: gcc -O2 test_perft.c -o test_perft && ./test_perft",
+        "Reports time per position for benchmarking"
+      ],
+      "effort_estimate": "Medium (2-3 hours)",
+      "dependencies": [],
+      "notes": "This is the FIRST thing that should be implemented before any engine changes. It acts as a regression test for all subsequent modifications. Fighter also lacks perft tests. The perft function itself is trivial: generate legal moves, for each move apply/recurse/undo, return count."
+    },
+    {
+      "id": "ENG-08",
+      "priority": "P1",
+      "title": "Optimize legal move cache with incremental Zobrist hash",
+      "description": "generate_legal_moves_cached (lines 1000-1024) and has_any_legal_move (lines 1028-1049) use compute_position_hash as cache key, which recomputes from scratch every call (O(64) for board scan). After ENG-01 (Zobrist hashing), this becomes O(1) since the hash is maintained incrementally. Additionally, the cache is invalidated too often because the weak hash may not match after complex move sequences. With proper Zobrist, cache hit rates should improve significantly.",
+      "files_affected": [
+        "csrc/chess.h:1000-1024 (generate_legal_moves_cached)",
+        "csrc/chess.h:1028-1049 (has_any_legal_move)"
+      ],
+      "acceptance_criteria": [
+        "Cache key uses env->zobrist_hash instead of compute_position_hash(env)",
+        "Cache lookup is O(1)",
+        "Cache hit rate > 95% when position hasn't changed between calls in same step",
+        "No behavioral change in game outcomes"
+      ],
+      "effort_estimate": "Small (30 min)",
+      "dependencies": ["ENG-01"],
+      "notes": "This is a direct consequence of ENG-01. Once we have incremental Zobrist, the cache becomes much more effective. Fighter has no caching at all."
+    },
+    {
+      "id": "ENG-09",
+      "priority": "P2",
+      "title": "Eliminate redundant material/positional score recomputation",
+      "description": "process_player_action (lines 1362-1364, 1412-1421) calls compute_material_score and compute_positional_score before and after each move. Each scans all 64 squares. With piece lists (ENG-03), this becomes O(n_pieces) but could be further optimized by maintaining running totals incrementally in apply_move_ex.",
+      "files_affected": [
+        "csrc/chess.h:295-328 (compute_material_score, compute_positional_score)",
+        "csrc/chess.h:1058-1149 (apply_move_ex - maintain incremental scores)",
+        "csrc/chess.h:1362-1421 (process_player_action - use incremental deltas)",
+        "csrc/chess.h:97-158 (ChessEnv struct - add material_score[2], positional_score[2])"
+      ],
+      "acceptance_criteria": [
+        "Material and positional scores maintained incrementally",
+        "Score deltas computed in O(1) per move instead of O(64)",
+        "Scores verified against from-scratch recomputation in debug builds",
+        "No change in reward values"
+      ],
+      "effort_estimate": "Medium (1-2 hours)",
+      "dependencies": ["ENG-03"],
+      "notes": "Fighter has no reward shaping, so this is our-engine-only optimization. The material/positional score functions are only called when reward_material/reward_position configs are non-zero, so this is only impactful when those features are enabled."
+    },
+    {
+      "id": "ENG-10",
+      "priority": "P2",
+      "title": "Reduce observation write overhead",
+      "description": "write_observations (lines 1519-1620) calls generate_legal_moves_cached (via compute_valid_pieces_mask and compute_valid_dests_mask) and is_in_check (4 calls: self/opp for both players). The legal move generation is cached but the valid_pieces/valid_dests computation scans the legal move list twice. Optimization: (1) compute valid_pieces mask during legal move generation itself; (2) cache is_in_check result since it doesn't change within a step.",
+      "files_affected": [
+        "csrc/chess.h:1463-1517 (compute_valid_pieces_mask, compute_valid_dests_mask)",
+        "csrc/chess.h:1519-1620 (write_observations)"
+      ],
+      "acceptance_criteria": [
+        "Observation values identical before and after optimization",
+        "is_in_check called at most once per player per step",
+        "Valid pieces mask computed during movegen pass, not separately"
+      ],
+      "effort_estimate": "Small (1-2 hours)",
+      "dependencies": [],
+      "notes": "Fighter's write_observations is much simpler (lines 707-767) - just 72 bytes with no validity masks. Our 301-byte observation with masks is more expensive but provides the agent with richer information for the two-phase action system."
+    },
+    {
+      "id": "ENG-11",
+      "priority": "P1",
+      "title": "Benchmark framework for engine performance comparison",
+      "description": "Create a benchmark harness that measures: (1) perft nodes/second at various depths, (2) legal move generation time per position, (3) is_square_attacked calls per step, (4) average step time in self-play. This enables data-driven optimization decisions and tracks progress across ENG-01 through ENG-10.",
+      "files_affected": [
+        "New file: csrc/benchmark_engine.c or tests/benchmark_engine.c"
+      ],
+      "acceptance_criteria": [
+        "Measures perft(5) from starting position in nodes/sec",
+        "Measures average generate_legal_moves time over 10000 random positions",
+        "Measures average c_step time over 1000 complete random games",
+        "Outputs results in machine-parseable format (JSON or CSV)",
+        "Can compare before/after for each optimization"
+      ],
+      "effort_estimate": "Medium (2-3 hours)",
+      "dependencies": ["ENG-07"],
+      "notes": "Essential for validating that optimizations actually improve performance. Without benchmarks, we're optimizing blind."
+    }
+  ],
+
+  "comparison_summary": {
+    "board_representation": {
+      "ours": "int8_t board[64], array-based, same as fighter",
+      "fighter": "int8_t board[64], array-based",
+      "gap": "NONE - identical approach"
+    },
+    "move_generation": {
+      "ours": "Loop-based pseudo-legal + is_move_legal filter (make/unmake), with legal move caching (lines 721-1049)",
+      "fighter": "Identical loop-based pseudo-legal + is_move_legal filter, no caching (lines 288-563)",
+      "gap": "We are AHEAD (have caching). Both lack pin-based optimization."
+    },
+    "attack_detection": {
+      "ours": "Loop-based is_square_attacked scanning all directions (lines 613-690)",
+      "fighter": "Identical loop-based is_square_attacked (lines 180-257)",
+      "gap": "NONE - identical approach"
+    },
+    "position_hashing": {
+      "ours": "Weak XOR hash with shift patterns (lines 571-581), used for repetition detection and move cache",
+      "fighter": "NO hashing at all, no repetition detection",
+      "gap": "We have more features but our hash quality is poor. Need Zobrist."
+    },
+    "move_encoding": {
+      "ours": "Internal: from*64+to (0-4095). External: two-phase 97 actions (pick piece, pick destination/promotion)",
+      "fighter": "Single-phase from*64+to (4096 actions) for both internal and external",
+      "gap": "Different design choices. Our two-phase is more RL-friendly (smaller action space) but adds complexity."
+    },
+    "move_application": {
+      "ours": "apply_move_ex with explicit promotion piece (lines 1058-1149)",
+      "fighter": "apply_move with auto-queen only (lines 569-650)",
+      "gap": "We support underpromotion. Fighter always auto-queens."
+    },
+    "observations": {
+      "ours": "301 bytes: board(64) + metadata(7) + phase(2) + selected_piece(64) + valid_pieces(64) + valid_dests(64) + valid_promos(32) + check(2) + rule50(1) + pass(1)",
+      "fighter": "72 bytes: board(64) + metadata(8)",
+      "gap": "Our obs is richer for two-phase action system. Fighter relies on agent learning implicit validity."
+    },
+    "game_rules": {
+      "ours": "Checkmate, stalemate, 50-move, insufficient material, threefold repetition (with toggles)",
+      "fighter": "Checkmate, stalemate, 50-move, insufficient material (no repetition detection)",
+      "gap": "We have more complete rules."
+    },
+    "reward_system": {
+      "ours": "Win/loss/draw + configurable: invalid_piece/move, capture_bonus, check_bonus, material_delta, positional_delta, castling, repetition_penalty, SEE/hanging, draw_reward",
+      "fighter": "Win/loss + illegal_move_penalty + step_penalty(-0.001)",
+      "gap": "We have dramatically richer reward shaping. Fighter is minimal."
+    },
+    "struct_size": {
+      "ours": "~5KB+ (board + phase_state[2] + position_history[512] + legal_moves_cache[256] + all reward configs)",
+      "fighter": "~200 bytes (board + minimal state)",
+      "gap": "Our struct is much larger. May affect cache performance with many parallel envs."
+    }
+  },
+
+  "priority_order": [
+    "ENG-07: Perft test suite (FIRST - safety net for all other changes)",
+    "ENG-01: Zobrist hashing (fixes correctness issue with repetition/cache)",
+    "ENG-02: King square caching (easy win, prerequisite for ENG-04)",
+    "ENG-11: Benchmark framework (enables measuring impact of changes)",
+    "ENG-08: Optimize legal move cache with Zobrist (quick win after ENG-01)",
+    "ENG-04: Pinned-piece optimization (significant speedup for legality checking)",
+    "ENG-05: Attack detection optimization (moderate speedup)",
+    "ENG-03: Piece lists (moderate speedup for movegen and scoring)",
+    "ENG-10: Observation write optimization (moderate speedup)",
+    "ENG-09: Incremental material/positional scores (small speedup when reward shaping enabled)",
+    "ENG-06: Bitboard migration (large effort, large reward, long-term)"
+  ]
+}

@@ -65,6 +65,7 @@
 #define GAME_STALEMATE 2
 #define GAME_FIFTY_MOVE 3
 #define GAME_INSUFFICIENT 4
+#define GAME_REPETITION 5
 
 // ============================================================================
 // Structures
@@ -80,6 +81,8 @@ typedef struct Log {
     float material_score;
     float positional_score;
     float invalid_action_rate;
+    float chess_moves;
+    float repetitions;
     float n;
 } Log;
 
@@ -125,6 +128,17 @@ typedef struct ChessEnv {
     // Reward shaping config
     float reward_capture_bonus;   // default 0.0
     float reward_check_bonus;     // default 0.0
+    float reward_repetition;      // default 0.0 - penalty per repeated position
+    float reward_material;        // default 0.0 - scale for material delta per move
+    float reward_position;        // default 0.0 - scale for positional delta per move
+    float reward_castling;        // default 0.0 - one-time castling bonus
+
+    // Position history for threefold repetition
+    uint64_t position_history[512];
+    int position_history_count;
+
+    // Per-episode chess move counter
+    int episode_chess_moves;
 
     // FEN curriculum
     int use_curriculum;
@@ -304,6 +318,48 @@ static int compute_positional_score(ChessEnv* env, int player) {
 static inline int captured_piece_value(int8_t piece) {
     if (piece == EMPTY) return 0;
     return PIECE_VALUES[(int)piece];
+}
+
+// ============================================================================
+// Position hashing and repetition detection
+// ============================================================================
+
+// Simple position hash: XOR board bytes with shifting, plus game state
+static uint64_t compute_position_hash(ChessEnv* env) {
+    uint64_t hash = 0;
+    for (int i = 0; i < 64; i++) {
+        hash ^= ((uint64_t)(unsigned char)env->board[i]) << ((i % 8) * 8);
+        hash ^= ((uint64_t)(unsigned char)env->board[i]) << ((i / 8) * 7);
+    }
+    hash ^= (uint64_t)env->castling_rights << 32;
+    hash ^= (uint64_t)(env->en_passant_square + 1) << 40;
+    hash ^= (uint64_t)env->current_player << 48;
+    return hash;
+}
+
+// Record current position hash in history
+static void record_position_hash(ChessEnv* env) {
+    uint64_t hash = compute_position_hash(env);
+    if (env->position_history_count < 512) {
+        env->position_history[env->position_history_count++] = hash;
+    }
+}
+
+// Count occurrences of current position in history
+static int count_position_occurrences(ChessEnv* env) {
+    uint64_t current = compute_position_hash(env);
+    int count = 0;
+    for (int i = 0; i < env->position_history_count; i++) {
+        if (env->position_history[i] == current) {
+            count++;
+        }
+    }
+    return count;
+}
+
+// Check for threefold repetition (3 or more occurrences)
+static int check_threefold_repetition(ChessEnv* env) {
+    return count_position_occurrences(env) >= 3;
 }
 
 // ============================================================================
@@ -816,6 +872,11 @@ static void apply_move(ChessEnv* env, int from_sq, int to_sq) {
 // ============================================================================
 
 static int check_game_end(ChessEnv* env, int has_legal) {
+    // Threefold repetition
+    if (check_threefold_repetition(env)) {
+        return GAME_REPETITION;
+    }
+
     // Fifty-move rule
     if (env->halfmove_clock >= 100) {
         return GAME_FIFTY_MOVE;
@@ -1016,6 +1077,21 @@ static int process_player_action(ChessEnv* env, int action, int player) {
             cap_piece = (player == 0) ? BP : WP;
         }
 
+        // Save material/positional advantage BEFORE move (own - opponent)
+        int opp_player = 1 - player;
+        int mat_before = compute_material_score(env, player) - compute_material_score(env, opp_player);
+        int pos_before = compute_positional_score(env, player) - compute_positional_score(env, opp_player);
+
+        // Detect castling: king moving 2 squares
+        int is_castling = 0;
+        if (mtype == WK) {
+            int from_col_val = sq_col(from_sq);
+            int to_col_val = sq_col(to_sq);
+            int col_diff = to_col_val - from_col_val;
+            if (col_diff < 0) col_diff = -col_diff;
+            if (col_diff == 2) is_castling = 1;
+        }
+
         // Valid move - apply it
         apply_move_ex(env, from_sq, to_sq, promo_piece);
 
@@ -1036,6 +1112,25 @@ static int process_player_action(ChessEnv* env, int action, int player) {
             if (is_in_check(env, opp)) {
                 env->rewards[player] += env->reward_check_bonus;
             }
+        }
+
+        // Material delta reward (advantage = own - opponent)
+        if (env->reward_material != 0.0f) {
+            int mat_after = compute_material_score(env, player) - compute_material_score(env, opp_player);
+            int mat_delta = mat_after - mat_before;
+            env->rewards[player] += env->reward_material * (float)mat_delta / 100.0f;
+        }
+
+        // Positional delta reward (advantage = own - opponent)
+        if (env->reward_position != 0.0f) {
+            int pos_after = compute_positional_score(env, player) - compute_positional_score(env, opp_player);
+            int pos_delta = pos_after - pos_before;
+            env->rewards[player] += env->reward_position * (float)pos_delta / 100.0f;
+        }
+
+        // Castling bonus
+        if (is_castling && env->reward_castling != 0.0f) {
+            env->rewards[player] += env->reward_castling;
         }
 
         return 1; // Chess move completed
@@ -1385,6 +1480,10 @@ void init(ChessEnv* env) {
     env->reward_valid_move = 0.0f;
     env->reward_capture_bonus = 0.0f;
     env->reward_check_bonus = 0.0f;
+    env->reward_repetition = 0.0f;
+    env->reward_material = 0.0f;
+    env->reward_position = 0.0f;
+    env->reward_castling = 0.0f;
     env->use_curriculum = 0;
 }
 
@@ -1411,8 +1510,13 @@ void c_reset(ChessEnv* env) {
     env->terminals[0] = 0;
     env->terminals[1] = 0;
 
-    // Reset per-episode counter (log accumulates across episodes)
+    // Reset per-episode counters (log accumulates across episodes)
     env->episode_illegal_moves = 0.0f;
+    env->episode_chess_moves = 0;
+
+    // Reset position history and record initial position
+    env->position_history_count = 0;
+    record_position_hash(env);
 
     write_observations(env);
 }
@@ -1452,8 +1556,22 @@ void c_step(ChessEnv* env) {
     int result = GAME_ONGOING;
 
     if (move_made) {
+        // Track chess moves per episode
+        env->episode_chess_moves++;
+
         // A chess move was completed - switch turn
         env->current_player = 1 - env->current_player;
+
+        // Record position hash (after turn switch so hash includes correct player)
+        record_position_hash(env);
+
+        // Repetition penalty for the player who just moved
+        if (env->reward_repetition != 0.0f) {
+            int occ = count_position_occurrences(env);
+            if (occ >= 2) {
+                env->rewards[player] += env->reward_repetition;
+            }
+        }
 
         // Check game end
         result = check_game_end(env, has_any_legal_move(env));
@@ -1477,6 +1595,21 @@ void c_step(ChessEnv* env) {
             env->log.material_score += (float)(compute_material_score(env, 0) - compute_material_score(env, 1));
             env->log.positional_score += (float)(compute_positional_score(env, 0) - compute_positional_score(env, 1));
             env->log.invalid_action_rate += (env->step_count > 0) ? env->episode_illegal_moves / (float)env->step_count : 0.0f;
+            env->log.chess_moves += (float)env->episode_chess_moves;
+            env->log.n += 1;
+        } else if (result == GAME_REPETITION) {
+            env->terminals[0] = 1;
+            env->terminals[1] = 1;
+
+            env->log.episode_length += (float)env->step_count;
+            env->log.episode_return += env->rewards[0];
+            env->log.draws += 1;
+            env->log.illegal_moves += env->episode_illegal_moves;
+            env->log.material_score += (float)(compute_material_score(env, 0) - compute_material_score(env, 1));
+            env->log.positional_score += (float)(compute_positional_score(env, 0) - compute_positional_score(env, 1));
+            env->log.invalid_action_rate += (env->step_count > 0) ? env->episode_illegal_moves / (float)env->step_count : 0.0f;
+            env->log.chess_moves += (float)env->episode_chess_moves;
+            env->log.repetitions += 1;
             env->log.n += 1;
         } else if (result == GAME_STALEMATE || result == GAME_FIFTY_MOVE || result == GAME_INSUFFICIENT) {
             env->terminals[0] = 1;
@@ -1489,6 +1622,7 @@ void c_step(ChessEnv* env) {
             env->log.material_score += (float)(compute_material_score(env, 0) - compute_material_score(env, 1));
             env->log.positional_score += (float)(compute_positional_score(env, 0) - compute_positional_score(env, 1));
             env->log.invalid_action_rate += (env->step_count > 0) ? env->episode_illegal_moves / (float)env->step_count : 0.0f;
+            env->log.chess_moves += (float)env->episode_chess_moves;
             env->log.n += 1;
         }
     }
@@ -1509,6 +1643,7 @@ void c_step(ChessEnv* env) {
         env->log.material_score += (float)(compute_material_score(env, 0) - compute_material_score(env, 1));
         env->log.positional_score += (float)(compute_positional_score(env, 0) - compute_positional_score(env, 1));
         env->log.invalid_action_rate += (env->step_count > 0) ? env->episode_illegal_moves / (float)env->step_count : 0.0f;
+        env->log.chess_moves += (float)env->episode_chess_moves;
         env->log.n += 1;
     }
 }

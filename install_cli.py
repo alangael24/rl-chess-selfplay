@@ -248,6 +248,8 @@ class Chess(pufferlib.PufferEnv):
                  reward_invalid_piece=-0.01, reward_invalid_move=-0.01,
                  reward_valid_piece=0.0, reward_valid_move=0.0,
                  reward_capture_bonus=0.0, reward_check_bonus=0.0,
+                 reward_repetition=0.0, reward_material=0.0,
+                 reward_position=0.0, reward_castling=0.0,
                  fen_file=None, fen_curric_pct=0.0,
                  buf=None, seed=0):
 
@@ -269,6 +271,10 @@ class Chess(pufferlib.PufferEnv):
             reward_valid_move=reward_valid_move,
             reward_capture_bonus=reward_capture_bonus,
             reward_check_bonus=reward_check_bonus,
+            reward_repetition=reward_repetition,
+            reward_material=reward_material,
+            reward_position=reward_position,
+            reward_castling=reward_castling,
             fen_curric_pct=fen_curric_pct,
             num_games=num_envs,
         )
@@ -327,6 +333,10 @@ reward_valid_piece = 0.0
 reward_valid_move = 0.0
 reward_capture_bonus = 0.0
 reward_check_bonus = 0.0
+reward_repetition = 0.0
+reward_material = 0.0
+reward_position = 0.0
+reward_castling = 0.0
 fen_curric_pct = 0.0
 report_interval = 128
 

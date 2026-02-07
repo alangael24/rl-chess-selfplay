@@ -129,6 +129,10 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     float reward_valid_move    = (float)unpack_kwarg(kwargs, "reward_valid_move", 0.0);
     float reward_capture_bonus = (float)unpack_kwarg(kwargs, "reward_capture_bonus", 0.0);
     float reward_check_bonus   = (float)unpack_kwarg(kwargs, "reward_check_bonus", 0.0);
+    float reward_repetition    = (float)unpack_kwarg(kwargs, "reward_repetition", 0.0);
+    float reward_material      = (float)unpack_kwarg(kwargs, "reward_material", 0.0);
+    float reward_position      = (float)unpack_kwarg(kwargs, "reward_position", 0.0);
+    float reward_castling      = (float)unpack_kwarg(kwargs, "reward_castling", 0.0);
     float fen_curric_pct       = (float)unpack_kwarg(kwargs, "fen_curric_pct", 0.0);
 
     /* Parse fen_file string kwarg */
@@ -230,6 +234,10 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         game->reward_valid_move = reward_valid_move;
         game->reward_capture_bonus = reward_capture_bonus;
         game->reward_check_bonus = reward_check_bonus;
+        game->reward_repetition = reward_repetition;
+        game->reward_material = reward_material;
+        game->reward_position = reward_position;
+        game->reward_castling = reward_castling;
         game->use_curriculum = (fen_curric_pct > 0.0f && vec->fen_count > 0) ? 1 : 0;
         game->obs_stride = obs_stride_bytes;
     }
@@ -264,6 +272,9 @@ static void vec_reset_game(VecEnv* vec, int g) {
             game->rewards[1] = 0.0f;
             game->terminals[0] = 0;
             game->terminals[1] = 0;
+            /* Re-record position hash for the FEN position */
+            game->position_history_count = 0;
+            record_position_hash(game);
             write_observations(game);
         }
     }
@@ -310,6 +321,9 @@ static PyObject* vec_step(PyObject* self, PyObject* args) {
                 game->rewards[1] = 0.0f;
                 game->terminals[0] = 0;
                 game->terminals[1] = 0;
+                /* Re-record position hash for the FEN position */
+                game->position_history_count = 0;
+                record_position_hash(game);
                 write_observations(game);
             }
         }
@@ -364,6 +378,14 @@ static PyObject* vec_log(PyObject* self, PyObject* args) {
     agg.material_score *= inv_n;
     agg.positional_score *= inv_n;
     agg.invalid_action_rate *= inv_n;
+    agg.chess_moves    *= inv_n;
+    agg.repetitions    *= inv_n;
+
+    /* Compute derived fields from raw aggregated values */
+    float draw_rate = agg.draws;
+    float white_winrate = agg.white_wins;
+    float black_winrate = agg.black_wins;
+    float score = white_winrate + 0.5f * draw_rate;
 
     assign_float(dict, "episode_length", agg.episode_length);
     assign_float(dict, "episode_return", agg.episode_return);
@@ -374,6 +396,12 @@ static PyObject* vec_log(PyObject* self, PyObject* args) {
     assign_float(dict, "material_score", agg.material_score);
     assign_float(dict, "positional_score", agg.positional_score);
     assign_float(dict, "invalid_action_rate", agg.invalid_action_rate);
+    assign_float(dict, "draw_rate", draw_rate);
+    assign_float(dict, "white_winrate", white_winrate);
+    assign_float(dict, "black_winrate", black_winrate);
+    assign_float(dict, "score", score);
+    assign_float(dict, "chess_moves", agg.chess_moves);
+    assign_float(dict, "repetitions", agg.repetitions);
     assign_float(dict, "n", n);
 
     return dict;

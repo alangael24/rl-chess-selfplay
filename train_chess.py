@@ -26,6 +26,7 @@ import sys
 
 import pufferlib
 import pufferlib.pytorch
+import pufferlib.models
 
 from chess_env import Chess, OBS_SIZE, NUM_ACTIONS
 
@@ -63,12 +64,19 @@ class ResidualBlock(nn.Module):
 
 
 class Policy(nn.Module):
+    """Chess policy following PufferLib's encode/decode pattern.
+
+    Implements encode_observations() and decode_actions() so it can be
+    wrapped by pufferlib.models.LSTMWrapper for recurrence.
+    Action masking data is stored during encode_observations and used
+    in decode_actions.
+    """
     def __init__(self, env, hidden_size=256, num_blocks=2):
         super().__init__()
         self.hidden_size = hidden_size
-        self.num_lstm_layers = 1
+        self.is_continuous = False
 
-        # CNN input: 13 board channels + 3 spatial channels (valid_pieces, valid_dests, selected_piece)
+        # CNN input: 13 board channels + 3 spatial channels
         conv_in = NUM_PIECE_TYPES + 3
         conv_channels = 64
         self.board_stem = nn.Conv2d(
@@ -91,20 +99,15 @@ class Policy(nn.Module):
             nn.Linear(hidden_size + 64, hidden_size))
         self.fusion_ln = nn.LayerNorm(hidden_size)
 
-        # LSTM for temporal context across steps
-        self.lstm = nn.LSTM(
-            input_size=hidden_size,
-            hidden_size=hidden_size,
-            num_layers=self.num_lstm_layers,
-            batch_first=True,
-        )
-
         self.actor = pufferlib.pytorch.layer_init(
             nn.Linear(hidden_size, NUM_ACTIONS), std=0.01)
         self.critic = pufferlib.pytorch.layer_init(
             nn.Linear(hidden_size, 1), std=1.0)
 
-    def forward_eval(self, x, state=None):
+        # Action mask stored during encode_observations for use in decode_actions
+        self._action_mask = None
+
+    def encode_observations(self, x, state=None):
         batch_size = x.shape[0]
 
         # Parse observation
@@ -127,12 +130,11 @@ class Policy(nn.Module):
         board_oh = F.one_hot(board, num_classes=NUM_PIECE_TYPES).float()
         board_oh = board_oh.view(batch_size, 8, 8, NUM_PIECE_TYPES).permute(0, 3, 1, 2)
 
-        # Spatial channels: valid_pieces, valid_dests, selected_piece -> each 8x8
+        # Spatial channels
         vp_plane = valid_pieces.view(batch_size, 1, 8, 8)
         vd_plane = valid_dests.view(batch_size, 1, 8, 8)
         sp_plane = selected.view(batch_size, 1, 8, 8)
 
-        # Concatenate: 13 + 3 = 16 channels
         spatial = torch.cat([board_oh, vp_plane, vd_plane, sp_plane], dim=1)
 
         board_x = F.relu(self.board_gn(self.board_stem(spatial)))
@@ -147,53 +149,53 @@ class Policy(nn.Module):
         scalar_feat = self.scalar_encoder(scalars)
 
         combined = torch.cat([board_feat, scalar_feat], dim=1)
-        feat = F.relu(self.fusion_ln(self.fusion_fc(combined)))
+        hidden = F.relu(self.fusion_ln(self.fusion_fc(combined)))
 
-        # LSTM: expects (batch, seq, features)
-        if state is None:
-            h = torch.zeros(self.num_lstm_layers, batch_size, self.hidden_size,
-                            device=x.device, dtype=feat.dtype)
-            c = torch.zeros(self.num_lstm_layers, batch_size, self.hidden_size,
-                            device=x.device, dtype=feat.dtype)
-            state = (h, c)
-
-        feat = feat.unsqueeze(1)  # (batch, 1, hidden)
-        lstm_out, state = self.lstm(feat, state)
-        feat = lstm_out.squeeze(1)  # (batch, hidden)
-
-        logits = self.actor(feat)
-
-        # Build action mask from observation
-        # Phase 0: valid actions are valid_pieces squares (0-63) + pass
-        # Phase 1: valid actions are valid_dests squares (0-63) + valid_promos (64-95) + pass
-        is_phase0 = phase[:, 0:1] > 0.5  # (batch, 1)
-
+        # Build and store action mask for decode_actions
+        is_phase0 = phase[:, 0:1] > 0.5
         mask = torch.zeros(batch_size, NUM_ACTIONS, device=x.device, dtype=torch.bool)
-
-        # Squares 0-63
-        vp_bool = valid_pieces > 0.5  # (batch, 64)
-        vd_bool = valid_dests > 0.5   # (batch, 64)
+        vp_bool = valid_pieces > 0.5
+        vd_bool = valid_dests > 0.5
         mask[:, :64] = torch.where(is_phase0, vp_bool, vd_bool)
-
-        # Promotions 64-95
-        promo_bool = valid_promos > 0.5  # (batch, 32)
+        promo_bool = valid_promos > 0.5
         mask[:, 64:96] = torch.where(is_phase0, torch.zeros_like(promo_bool), promo_bool)
-
-        # Pass action 96
-        pass_bool = pass_valid.squeeze(-1) > 0.5  # (batch,)
+        pass_bool = pass_valid.squeeze(-1) > 0.5
         mask[:, 96] = pass_bool
+        self._action_mask = mask
 
-        masked_logits = logits.masked_fill(~mask, -1e9)
+        return hidden
 
-        # Safety fallback for unexpected all-zero masks
-        all_masked = ~mask.any(dim=1)
-        if all_masked.any():
-            masked_logits[all_masked] = logits[all_masked]
+    def decode_actions(self, hidden):
+        logits = self.actor(hidden)
+        value = self.critic(hidden)
 
-        return masked_logits, self.critic(feat), state
+        # Apply action mask stored from encode_observations
+        if self._action_mask is not None:
+            mask = self._action_mask
+            # Handle batch size mismatch (training reshapes B*T)
+            if mask.shape[0] != logits.shape[0]:
+                mask = None
+            else:
+                masked_logits = logits.masked_fill(~mask, -1e9)
+                all_masked = ~mask.any(dim=1)
+                if all_masked.any():
+                    masked_logits[all_masked] = logits[all_masked]
+                logits = masked_logits
+
+        return logits, value
+
+    def forward_eval(self, x, state=None):
+        hidden = self.encode_observations(x, state=state)
+        logits, value = self.decode_actions(hidden)
+        return logits, value
 
     def forward(self, x, state=None):
         return self.forward_eval(x, state)
+
+
+class ChessLSTM(pufferlib.models.LSTMWrapper):
+    def __init__(self, env, policy, input_size=256, hidden_size=256):
+        super().__init__(env, policy, input_size, hidden_size)
 
 
 if __name__ == "__main__":
@@ -227,6 +229,7 @@ if __name__ == "__main__":
     args['train']['clip_coef'] = 0.15
     args['train']['max_grad_norm'] = 1.0
     args['train']['anneal_lr'] = True
+    args['train']['use_rnn'] = True
 
     NUM_GAMES = 2048
     NUM_AGENTS = NUM_GAMES * 2
@@ -247,7 +250,8 @@ if __name__ == "__main__":
     )
 
     device = args['train'].get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
-    policy = Policy(vecenv, hidden_size=256, num_blocks=2).to(device)
+    base_policy = Policy(vecenv, hidden_size=256, num_blocks=2)
+    policy = ChessLSTM(vecenv, base_policy, input_size=256, hidden_size=256).to(device)
 
     print(f"\n  Params: {sum(p.numel() for p in policy.parameters()):,}")
     print(f"  Device: {device}")

@@ -21,11 +21,16 @@ pufferlib_ocean = os.path.join(os.path.dirname(pufferlib.__file__), 'ocean')
 here = os.path.dirname(os.path.abspath(__file__))
 
 extra_compile_args = ['-O3', '-ffast-math', '-march=native', '-std=c11']
+extra_link_args = []
 if sys.platform == 'darwin':
     extra_compile_args.append('-stdlib=libc++')
+elif sys.platform.startswith('linux'):
+    extra_compile_args.append('-fopenmp')
+    extra_link_args.append('-fopenmp')
 
 if os.environ.get('DEBUG'):
     extra_compile_args = ['-g', '-O0', '-fsanitize=address', '-std=c11']
+    extra_link_args = []
 
 extension = Extension(
     'csrc.binding',
@@ -36,6 +41,7 @@ extension = Extension(
         pufferlib_ocean,
     ],
     extra_compile_args=extra_compile_args,
+    extra_link_args=extra_link_args,
     define_macros=[('NPY_NO_DEPRECATED_API', 'NPY_1_7_API_VERSION')],
 )
 

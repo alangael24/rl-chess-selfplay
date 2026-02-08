@@ -55,8 +55,12 @@ def install():
     print("\nBuilding C extension...")
     import numpy as np
     compile_args = ['-O3', '-ffast-math', '-march=native', '-std=c11']
+    link_args = []
     if sys.platform == 'darwin':
         compile_args.append('-stdlib=libc++')
+    elif sys.platform.startswith('linux'):
+        compile_args.append('-fopenmp')
+        link_args.append('-fopenmp')
 
     binding_c = os.path.join(chess_ocean_dir, 'binding.c')
     import sysconfig
@@ -87,6 +91,7 @@ def install():
         '-DNPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION',
         binding_c,
         '-o', binding_so,
+        *link_args,
         *python_ldflags,
         f'-lpython{python_ver}',
     ]
@@ -151,16 +156,25 @@ def install():
 def build_with_setuptools(chess_ocean_dir, ocean_dir):
     """Fallback: build using setuptools."""
     import numpy as np
+    openmp_compile = '["-fopenmp"]' if sys.platform.startswith('linux') else '[]'
+    openmp_link = '["-fopenmp"]' if sys.platform.startswith('linux') else '[]'
     setup_content = f'''
 from setuptools import setup, Extension
 import numpy as np
+import sys
+extra_compile_args = ["-O3", "-ffast-math", "-march=native", "-std=c11"]
+extra_link_args = []
+if sys.platform.startswith("linux"):
+    extra_compile_args += {openmp_compile}
+    extra_link_args += {openmp_link}
 setup(
     name="chess-binding",
     ext_modules=[Extension(
         "binding",
         sources=["{os.path.join(chess_ocean_dir, "binding.c")}"],
         include_dirs=["{chess_ocean_dir}", "{np.get_include()}", "{ocean_dir}"],
-        extra_compile_args=["-O3", "-ffast-math", "-march=native", "-std=c11"],
+        extra_compile_args=extra_compile_args,
+        extra_link_args=extra_link_args,
         define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
     )],
 )

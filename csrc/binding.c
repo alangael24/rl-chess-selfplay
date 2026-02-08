@@ -19,6 +19,9 @@
 #include <Python.h>
 #include <numpy/arrayobject.h>
 #include <stdio.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "chess.h"
 
 typedef struct {
@@ -284,6 +287,10 @@ static PyObject* vec_reset(PyObject* self, PyObject* args) {
     VecEnv* vec = (VecEnv*)PyLong_AsVoidPtr(PyTuple_GetItem(args, 0));
     int seed = (int)PyLong_AsLong(PyTuple_GetItem(args, 1));
 
+    Py_BEGIN_ALLOW_THREADS
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int g = 0; g < vec->num_games; g++) {
         vec->games[g].rng_state = (uint64_t)(seed * vec->num_games + g + 1);
         if (vec->games[g].rng_state == 0) vec->games[g].rng_state = 1;
@@ -291,6 +298,7 @@ static PyObject* vec_reset(PyObject* self, PyObject* args) {
         memset(&vec->games[g].log, 0, sizeof(Log));
         vec_reset_game(vec, g);
     }
+    Py_END_ALLOW_THREADS
     Py_RETURN_NONE;
 }
 
@@ -300,6 +308,10 @@ static PyObject* vec_reset(PyObject* self, PyObject* args) {
 static PyObject* vec_step(PyObject* self, PyObject* args) {
     VecEnv* vec = (VecEnv*)PyLong_AsVoidPtr(PyTuple_GetItem(args, 0));
 
+    Py_BEGIN_ALLOW_THREADS
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int g = 0; g < vec->num_games; g++) {
         ChessEnv* game = &vec->games[g];
         int was_terminal = game->terminals[0];
@@ -323,6 +335,7 @@ static PyObject* vec_step(PyObject* self, PyObject* args) {
             }
         }
     }
+    Py_END_ALLOW_THREADS
     Py_RETURN_NONE;
 }
 

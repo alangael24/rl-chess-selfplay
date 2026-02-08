@@ -231,8 +231,9 @@ if __name__ == "__main__":
     args['train']['anneal_lr'] = True
     args['train']['use_rnn'] = True
 
-    NUM_GAMES = 2048
+    NUM_GAMES = 1024
     NUM_AGENTS = NUM_GAMES  # 1 agent per game
+    EVAL_EVERY = 10
 
     vecenv = pufferlib.vector.make(
         Chess,
@@ -258,13 +259,15 @@ if __name__ == "__main__":
     print(f"  Device: {device}")
     print(f"  Games: {NUM_GAMES}")
     print(f"  Agents: {NUM_AGENTS}")
+    print(f"  Eval every: {EVAL_EVERY} epochs")
     print("=" * 60)
 
     trainer = pufferl.PuffeRL(args['train'], vecenv, policy)
 
     try:
         while trainer.epoch < trainer.total_epochs:
-            trainer.evaluate()
+            if trainer.epoch == 0 or (trainer.epoch % EVAL_EVERY == 0):
+                trainer.evaluate()
             trainer.train()
     except KeyboardInterrupt:
         print("\nInterrupted")

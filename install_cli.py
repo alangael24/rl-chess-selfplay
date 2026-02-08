@@ -360,7 +360,7 @@ policy_name = Chess
 rnn_name = ChessLSTM
 
 [env]
-num_envs = 2048
+num_envs = 1024
 max_steps = 256
 illegal_move_penalty = -0.1
 reward_invalid_piece = -0.01
@@ -404,8 +404,8 @@ clip_coef = 0.15
 vf_coef = 0.5
 max_grad_norm = 1.0
 update_epochs = 1
-batch_size = 131072
-minibatch_size = 32768
+batch_size = 262144
+minibatch_size = 65536
 bptt_horizon = 128
 checkpoint_interval = 500
 anneal_lr = True

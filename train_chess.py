@@ -156,8 +156,8 @@ class Policy(nn.Module):
         mask[:, :64] = torch.where(is_phase0, vp_bool, vd_bool)
         promo_bool = valid_promos > 0.5
         mask[:, 64:96] = torch.where(is_phase0, torch.zeros_like(promo_bool), promo_bool)
-        pass_bool = pass_valid.squeeze(-1) > 0.5
-        mask[:, 96] = pass_bool
+        # PASS is legacy and should remain invalid in 1-agent topology.
+        mask[:, 96] = False
         self._action_mask = mask
 
         return hidden

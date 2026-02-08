@@ -1948,10 +1948,12 @@ static void write_observations(ChessEnv* env) {
         }
     }
 
-    // === Side to move one-hot (offset 64, size 2) ===
-    // Always [255, 0] since obs is always from current mover's perspective
-    obs[64] = 255;
-    obs[65] = 0;
+    // === Side one-hot relative to learner (offset 64, size 2) ===
+    // [1, 0] => learner to move, [0, 1] => opponent to move.
+    // This avoids hidden role aliasing in 1-agent self-play.
+    int learner_turn = (env->current_player == env->learner_color);
+    obs[64] = learner_turn ? 255 : 0;
+    obs[65] = learner_turn ? 0 : 255;
 
     // === Castling rights (offset 66, size 4) — from viewer's perspective ===
     if (viewer == 0) {
@@ -2002,9 +2004,9 @@ static void write_observations(ChessEnv* env) {
     if (rule50_scaled > 255) rule50_scaled = 255;
     obs[299] = (unsigned char)rule50_scaled;
 
-    // === Pass valid (offset 300, size 1) ===
-    // In 1-agent mode, it's always the mover's turn, so PASS is never valid
-    obs[300] = 0;
+    // === Learner-turn flag (offset 300, size 1) ===
+    // Reuses legacy pass-valid byte as an explicit learner-role bit.
+    obs[300] = learner_turn ? 255 : 0;
 }
 
 // ============================================================================

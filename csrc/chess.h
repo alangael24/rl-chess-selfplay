@@ -1219,8 +1219,9 @@ static int generate_pseudo_legal_moves(ChessEnv* env, int moves[], int max_moves
     return count;
 }
 
-// Test if a pseudo-legal move is legal (doesn't leave own king in check)
-static inline int is_move_legal(ChessEnv* env, int from_sq, int to_sq) {
+// Test if a pseudo-legal move is legal (doesn't leave own king in check).
+// Slow path: applies temporary move and restores full state.
+static inline int is_move_legal_slow(ChessEnv* env, int from_sq, int to_sq) {
     int player = env->current_player;
 
     // Save state
@@ -1304,16 +1305,123 @@ static inline int is_move_legal(ChessEnv* env, int from_sq, int to_sq) {
     return !in_check;
 }
 
+// Compute pinned pieces for side `player` from king square `king_sq`.
+// A piece is pinned if it is the first own piece on a ray from the king and
+// the next non-empty square on that same ray is an enemy slider.
+static inline Bitboard compute_pinned_pieces(ChessEnv* env, int player, int king_sq) {
+    Bitboard pinned = 0;
+    const int dirs[8][2] = {
+        { 1,  0}, {-1,  0}, { 0,  1}, { 0, -1},
+        { 1,  1}, { 1, -1}, {-1,  1}, {-1, -1}
+    };
+
+    int kr = sq_row(king_sq);
+    int kc = sq_col(king_sq);
+    for (int d = 0; d < 8; d++) {
+        int dr = dirs[d][0];
+        int dc = dirs[d][1];
+        int r = kr + dr;
+        int c = kc + dc;
+        int blocker_sq = -1;
+
+        while (on_board(r, c)) {
+            int sq = make_sq(r, c);
+            int8_t p = env->board[sq];
+            if (p != EMPTY) {
+                if (blocker_sq < 0) {
+                    if (is_own_piece(p, player)) {
+                        blocker_sq = sq;
+                    } else {
+                        break;
+                    }
+                } else {
+                    if (is_enemy_piece(p, player)) {
+                        int ptype = p;
+                        if (ptype >= BP) ptype -= 6;
+                        int orth = (dr == 0 || dc == 0);
+                        int diag = (dr != 0 && dc != 0);
+                        if ((orth && (ptype == WR || ptype == WQ)) ||
+                            (diag && (ptype == WB || ptype == WQ))) {
+                            pinned |= sq_bb(blocker_sq);
+                        }
+                    }
+                    break;
+                }
+            }
+            r += dr;
+            c += dc;
+        }
+    }
+    return pinned;
+}
+
+// Returns 1 if king->from->to are collinear on rook/bishop rays.
+static inline int is_move_on_pin_line(int king_sq, int from_sq, int to_sq) {
+    int kr = sq_row(king_sq), kc = sq_col(king_sq);
+    int fr = sq_row(from_sq), fc = sq_col(from_sq);
+    int tr = sq_row(to_sq), tc = sq_col(to_sq);
+    int drf = fr - kr, dcf = fc - kc;
+    int drt = tr - kr, dct = tc - kc;
+
+    if (drf == 0 && dcf == 0) return 0;
+    if (drf == 0) return drt == 0;
+    if (dcf == 0) return dct == 0;
+
+    if ((drf > 0 ? drf : -drf) != (dcf > 0 ? dcf : -dcf)) return 0;
+    if ((drt > 0 ? drt : -drt) != (dct > 0 ? dct : -dct)) return 0;
+
+    return (drf * dct) == (dcf * drt);
+}
+
+// Fast path legality:
+// - If side is in check, fallback to slow path.
+// - King moves and en-passant fallback to slow path.
+// - Non-pinned non-king non-ep moves are legal.
+// - Pinned moves must stay on the king-line.
+static inline int is_move_legal_fast(
+    ChessEnv* env, int from_sq, int to_sq, Bitboard pinned, int king_sq, int in_check
+) {
+    if (in_check) {
+        return is_move_legal_slow(env, from_sq, to_sq);
+    }
+
+    int8_t moved = env->board[from_sq];
+    if (moved == EMPTY) return 0;
+
+    int ptype = moved;
+    if (ptype >= BP) ptype -= 6;
+
+    if (ptype == WK) {
+        return is_move_legal_slow(env, from_sq, to_sq);
+    }
+    if (ptype == WP && to_sq == env->en_passant_square) {
+        return is_move_legal_slow(env, from_sq, to_sq);
+    }
+
+    if ((pinned & sq_bb(from_sq)) && !is_move_on_pin_line(king_sq, from_sq, to_sq)) {
+        return 0;
+    }
+
+    return 1;
+}
+
 // Generate all legal moves for current player
 static int generate_legal_moves(ChessEnv* env, int moves[], int max_moves) {
     int pseudo_moves[CHESS_MAX_MOVES];
     int pseudo_count = generate_pseudo_legal_moves(env, pseudo_moves, CHESS_MAX_MOVES);
+    int player = env->current_player;
+
+    Bitboard king_bb = env->bb_by_color[player] & env->bb_by_type[BB_KING];
+    if (!king_bb) return 0;
+    int king_sq = bb_lsb(king_bb);
+    int in_check = is_square_attacked(env, king_sq, 1 - player);
+    Bitboard pinned = in_check ? 0 : compute_pinned_pieces(env, player, king_sq);
 
     int legal_count = 0;
     for (int i = 0; i < pseudo_count; i++) {
         int from_sq = pseudo_moves[i] / 64;
         int to_sq = pseudo_moves[i] % 64;
-        if (is_move_legal(env, from_sq, to_sq)) {
+        if (is_move_legal_fast(env, from_sq, to_sq, pinned, king_sq, in_check)) {
             if (legal_count < max_moves) {
                 moves[legal_count++] = pseudo_moves[i];
             }
@@ -1363,11 +1471,17 @@ static int has_any_legal_move(ChessEnv* env) {
     // Cache miss: do the full pseudo-legal scan
     int pseudo_moves[CHESS_MAX_MOVES];
     int pseudo_count = generate_pseudo_legal_moves(env, pseudo_moves, CHESS_MAX_MOVES);
+    int player = env->current_player;
+    Bitboard king_bb = env->bb_by_color[player] & env->bb_by_type[BB_KING];
+    if (!king_bb) return 0;
+    int king_sq = bb_lsb(king_bb);
+    int in_check = is_square_attacked(env, king_sq, 1 - player);
+    Bitboard pinned = in_check ? 0 : compute_pinned_pieces(env, player, king_sq);
 
     for (int i = 0; i < pseudo_count; i++) {
         int from_sq = pseudo_moves[i] / 64;
         int to_sq = pseudo_moves[i] % 64;
-        if (is_move_legal(env, from_sq, to_sq)) {
+        if (is_move_legal_fast(env, from_sq, to_sq, pinned, king_sq, in_check)) {
             return 1;
         }
     }

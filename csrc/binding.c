@@ -268,6 +268,8 @@ static void vec_reset_game(VecEnv* vec, int g) {
         if (r < vec->fen_curric_pct) {
             int idx = chess_rand_int(&game->rng_state, vec->fen_count);
             setup_from_fen(game, vec->fen_list[idx]);
+            /* Align learner perspective with side-to-move on curriculum starts. */
+            game->learner_color = game->current_player;
             /* Re-reset phase state and write obs for the FEN position */
             game->step_count = 0;
             game->phase_state[0].pick_phase = 0;
@@ -322,6 +324,8 @@ static PyObject* vec_step(PyObject* self, PyObject* args) {
             if (r < vec->fen_curric_pct) {
                 int idx = chess_rand_int(&game->rng_state, vec->fen_count);
                 setup_from_fen(game, vec->fen_list[idx]);
+                /* Align learner perspective with side-to-move on curriculum starts. */
+                game->learner_color = game->current_player;
                 game->step_count = 0;
                 game->phase_state[0].pick_phase = 0;
                 game->phase_state[0].selected_square = -1;

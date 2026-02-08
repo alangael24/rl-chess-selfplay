@@ -47,6 +47,7 @@ class Chess(pufferlib.PufferEnv):
         self.render_mode = render_mode
         # 1 agent per game: agent controls whoever's turn it is
         self.num_agents = num_envs
+        self.agents_per_batch = self.num_agents
 
         super().__init__(buf=buf)
 

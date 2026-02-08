@@ -262,6 +262,7 @@ class Chess(pufferlib.PufferEnv):
         self.report_interval = report_interval
         self.render_mode = render_mode
         self.num_agents = num_envs  # 1 agent per game
+        self.agents_per_batch = self.num_agents
 
         super().__init__(buf=buf)
 

@@ -83,6 +83,8 @@ class Chess(pufferlib.PufferEnv):
             seed,
             **init_kwargs,
         )
+        self.fen_curric_pct = float(fen_curric_pct)
+        self.fen_file = fen_file
 
     def reset(self, seed=None):
         self.tick = 0
@@ -108,6 +110,18 @@ class Chess(pufferlib.PufferEnv):
 
     def close(self):
         binding.vec_close(self.c_envs)
+
+    def load_fens(self, fen_file):
+        """Replace current FEN curriculum list at runtime."""
+        loaded = int(binding.vec_load_fens(self.c_envs, fen_file))
+        self.fen_file = fen_file
+        return loaded
+
+    def set_fen_curric_pct(self, pct):
+        """Update curriculum sampling probability at runtime (0.0 to 1.0)."""
+        pct = float(max(0.0, min(1.0, pct)))
+        binding.vec_set_fen_pct(self.c_envs, pct)
+        self.fen_curric_pct = pct
 
 
 def test_performance(timeout=10, num_envs=512):

@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import sys
+import argparse
 
 import pufferlib
 import pufferlib.pytorch
@@ -193,7 +194,80 @@ class ChessLSTM(pufferlib.models.LSTMWrapper):
         super().__init__(env, policy, input_size, hidden_size)
 
 
+def _clamp01(x):
+    return float(max(0.0, min(1.0, x)))
+
+
+def parse_curriculum_schedule(spec):
+    """Parse schedule like: '0:0.9,50:0.6,100:0.3,150:0.1,200:0.0'."""
+    if spec is None:
+        return []
+    spec = spec.strip()
+    if not spec:
+        return []
+    out = []
+    for item in spec.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        epoch_s, pct_s = item.split(':', 1)
+        out.append((int(epoch_s.strip()), _clamp01(float(pct_s.strip()))))
+    out.sort(key=lambda t: t[0])
+    return out
+
+
+def build_default_curriculum_schedule(start_pct):
+    start_pct = _clamp01(start_pct)
+    return [
+        (0, start_pct),
+        (50, min(start_pct, 0.60)),
+        (100, min(start_pct, 0.30)),
+        (150, min(start_pct, 0.10)),
+        (200, 0.0),
+    ]
+
+
+class FenCurriculumController:
+    def __init__(self, vecenv, schedule):
+        self.vecenv = vecenv
+        self.schedule = schedule
+        self.last_pct = None
+
+    def target_pct(self, epoch):
+        if not self.schedule:
+            return None
+        pct = self.schedule[0][1]
+        for at_epoch, at_pct in self.schedule:
+            if epoch >= at_epoch:
+                pct = at_pct
+            else:
+                break
+        return pct
+
+    def maybe_apply(self, epoch, force=False):
+        pct = self.target_pct(epoch)
+        if pct is None:
+            return
+        if (not force) and self.last_pct is not None and abs(self.last_pct - pct) < 1e-9:
+            return
+        self.vecenv.set_fen_curric_pct(pct)
+        self.last_pct = pct
+        print(f"[curriculum] epoch={epoch} fen_curric_pct={pct:.3f}")
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument('--num-games', type=int, default=1024)
+    parser.add_argument('--fen-file', type=str, default=None,
+                        help='Path to FEN curriculum file')
+    parser.add_argument('--fen-curric-pct', type=float, default=0.0,
+                        help='Initial probability of resetting from curriculum FENs')
+    parser.add_argument('--fen-curric-schedule', type=str, default='',
+                        help='Decay schedule epoch:pct pairs, e.g. 0:0.9,50:0.6,100:0.3,150:0.1,200:0.0')
+    parser.add_argument('--no-curriculum-decay', action='store_true',
+                        help='Keep fen_curric_pct fixed (ignore schedule)')
+    cli_args = parser.parse_args()
+
     print("=" * 60)
     print("CHESS SELF-PLAY TRAINING (standalone)")
     print("Two-phase action system: 97 actions")
@@ -226,9 +300,11 @@ if __name__ == "__main__":
     args['train']['anneal_lr'] = True
     args['train']['use_rnn'] = True
 
-    NUM_GAMES = 1024
+    NUM_GAMES = cli_args.num_games
     NUM_AGENTS = NUM_GAMES  # 1 agent per game
     EVAL_EVERY = 10
+
+    fen_curric_pct = _clamp01(cli_args.fen_curric_pct)
 
     vecenv = pufferlib.vector.make(
         Chess,
@@ -240,11 +316,30 @@ if __name__ == "__main__":
             'reward_invalid_move': -0.01,
             'reward_valid_piece': 0.0,
             'reward_valid_move': 0.0,
+            'fen_curric_pct': fen_curric_pct,
+            'fen_file': cli_args.fen_file,
         },
         num_envs=1,
         backend=pufferlib.PufferEnv,
     )
     vecenv.agents_per_batch = NUM_AGENTS
+
+    curriculum = None
+    if cli_args.fen_file:
+        schedule = []
+        if not cli_args.no_curriculum_decay:
+            schedule = parse_curriculum_schedule(cli_args.fen_curric_schedule)
+            if not schedule:
+                start_pct = fen_curric_pct if fen_curric_pct > 0.0 else 0.9
+                schedule = build_default_curriculum_schedule(start_pct)
+        elif fen_curric_pct > 0.0:
+            schedule = [(0, fen_curric_pct)]
+
+        if schedule:
+            curriculum = FenCurriculumController(vecenv, schedule)
+            curriculum.maybe_apply(epoch=0, force=True)
+            print(f"  Curriculum FEN file: {cli_args.fen_file}")
+            print(f"  Curriculum schedule: {schedule}")
 
     device = args['train'].get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
     base_policy = Policy(vecenv, hidden_size=256, num_blocks=2)
@@ -261,6 +356,8 @@ if __name__ == "__main__":
 
     try:
         while trainer.epoch < trainer.total_epochs:
+            if curriculum is not None:
+                curriculum.maybe_apply(trainer.epoch)
             if trainer.epoch == 0 or (trainer.epoch % EVAL_EVERY == 0):
                 trainer.evaluate()
             trainer.train()

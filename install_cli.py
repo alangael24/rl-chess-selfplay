@@ -311,6 +311,8 @@ class Chess(pufferlib.PufferEnv):
             self.num_agents, seed,
             **init_kwargs,
         )
+        self.fen_curric_pct = float(fen_curric_pct)
+        self.fen_file = fen_file
 
     def reset(self, seed=None):
         self.tick = 0
@@ -336,6 +338,16 @@ class Chess(pufferlib.PufferEnv):
 
     def close(self):
         binding.vec_close(self.c_envs)
+
+    def load_fens(self, fen_file):
+        loaded = int(binding.vec_load_fens(self.c_envs, fen_file))
+        self.fen_file = fen_file
+        return loaded
+
+    def set_fen_curric_pct(self, pct):
+        pct = float(max(0.0, min(1.0, pct)))
+        binding.vec_set_fen_pct(self.c_envs, pct)
+        self.fen_curric_pct = pct
 '''
 
 # --- Config .ini ---

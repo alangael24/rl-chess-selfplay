@@ -219,8 +219,8 @@ if __name__ == "__main__":
     args['train']['precision'] = 'bfloat16'
     args['train']['learning_rate'] = 1e-4
     args['train']['ent_coef'] = 0.005
-    args['train']['batch_size'] = 131072
-    args['train']['minibatch_size'] = 32768
+    args['train']['batch_size'] = 524288
+    args['train']['minibatch_size'] = 131072
     args['train']['bptt_horizon'] = 128
     args['train']['update_epochs'] = 1
     args['train']['checkpoint_interval'] = 500

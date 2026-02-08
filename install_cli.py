@@ -261,6 +261,8 @@ class Chess(pufferlib.PufferEnv):
         self.single_action_space = gymnasium.spaces.Discrete(NUM_ACTIONS)
         self.report_interval = report_interval
         self.render_mode = render_mode
+        # Required by newer PufferLib buffer setup path.
+        self.selfplay = 0
         self.num_agents = num_envs  # 1 agent per game
         self.agents_per_batch = self.num_agents
 

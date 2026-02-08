@@ -45,6 +45,8 @@ class Chess(pufferlib.PufferEnv):
         self.single_action_space = gymnasium.spaces.Discrete(NUM_ACTIONS)
         self.report_interval = report_interval
         self.render_mode = render_mode
+        # Required by newer PufferLib buffer setup path.
+        self.selfplay = 0
         # 1 agent per game: agent controls whoever's turn it is
         self.num_agents = num_envs
         self.agents_per_batch = self.num_agents

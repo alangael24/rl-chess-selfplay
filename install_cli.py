@@ -377,6 +377,7 @@ reward_draw = 0.0
 reward_see_hanging = 0.0
 enable_50_move_rule = 1
 enable_threefold_repetition = 1
+fen_file =
 fen_curric_pct = 0.0
 report_interval = 128
 

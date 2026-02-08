@@ -1,4 +1,4 @@
-"""Test suite for FEN curriculum system and reward shaping.
+"""Test suite for FEN curriculum system and reward shaping (1-agent-per-game topology).
 
 Tests:
 1. FEN parsing: standard starting position
@@ -39,8 +39,6 @@ OBS_OPP_CHECK = 298
 OBS_RULE50 = 299
 OBS_PASS_VALID = 300
 
-PASS_ACTION = 96
-
 # Piece constants (must match chess.h)
 EMPTY = 0
 WP, WN, WB, WR, WQ, WK = 1, 2, 3, 4, 5, 6
@@ -63,7 +61,7 @@ def make_sq(row, col):
     return row * 8 + col
 
 
-def get_obs(env, agent_idx):
+def get_obs(env, agent_idx=0):
     return env.observations[agent_idx]
 
 
@@ -87,11 +85,18 @@ def get_valid_dests(obs):
     return set(i for i in range(64) if obs[OBS_VALID_DESTS + i] == 255)
 
 
-def step_with_actions(env, white_action, black_action):
+def step_action(env, action, game_idx=0):
+    """Step environment with a single action for one game."""
     actions = np.zeros(env.num_agents, dtype=np.int32)
-    actions[0] = white_action
-    actions[1] = black_action
+    actions[game_idx] = action
     return env.step(actions)
+
+
+def make_move(env, from_sq, to_sq):
+    """Execute a full chess move (phase 0 + phase 1) for the current mover.
+    from_sq and to_sq are in the mover's perspective."""
+    step_action(env, from_sq)   # phase 0: pick piece
+    return step_action(env, to_sq)  # phase 1: pick dest
 
 
 def write_fen_file(fens):
@@ -116,16 +121,15 @@ env = Chess(num_envs=1, max_steps=500, fen_file=fen_file, fen_curric_pct=1.0)
 env.reset(seed=42)
 
 # With fen_curric_pct=1.0, every reset should use FEN
-# The starting position FEN should produce the same board as default
-white_obs = get_obs(env, 0)
-board = white_obs[OBS_BOARD:OBS_BOARD + 64]
+obs = get_obs(env)
+board = obs[OBS_BOARD:OBS_BOARD + 64]
 
 # Check white back rank (row 0 = rank 1)
 check("FEN start: a1=WR", board[make_sq(0, 0)] == WR)
 check("FEN start: b1=WN", board[make_sq(0, 1)] == WN)
 check("FEN start: e1=WK", board[make_sq(0, 4)] == WK)
-check("FEN start: White's turn", is_my_turn(white_obs))
-check("FEN start: Phase 0", get_phase(white_obs) == 0)
+check("FEN start: mover's turn", is_my_turn(obs))
+check("FEN start: Phase 0", get_phase(obs) == 0)
 
 # Verify pawns
 all_pawns_ok = True
@@ -150,8 +154,8 @@ fen_file = write_fen_file([sicilian_fen])
 env = Chess(num_envs=1, max_steps=500, fen_file=fen_file, fen_curric_pct=1.0)
 env.reset(seed=42)
 
-white_obs = get_obs(env, 0)
-board = white_obs[OBS_BOARD:OBS_BOARD + 64]
+obs = get_obs(env)
+board = obs[OBS_BOARD:OBS_BOARD + 64]
 
 # e4 pawn should be on e4 = row 3, col 4 = square 28
 check("Sicilian: e4 pawn", board[make_sq(3, 4)] == WP,
@@ -166,10 +170,10 @@ check("Sicilian: c5 black pawn", board[make_sq(4, 2)] == BP,
 check("Sicilian: Nc6", board[make_sq(5, 2)] == BN,
       f"got piece {board[make_sq(5, 2)]} at c6")
 # White's turn
-check("Sicilian: White's turn", is_my_turn(white_obs))
+check("Sicilian: mover's turn", is_my_turn(obs))
 
 # Castling should still be full
-castling = white_obs[OBS_CASTLING:OBS_CASTLING + 4]
+castling = obs[OBS_CASTLING:OBS_CASTLING + 4]
 check("Sicilian: All castling available", all(c == 255 for c in castling),
       f"castling={list(castling)}")
 
@@ -189,8 +193,8 @@ fen_file = write_fen_file([ep_fen])
 env = Chess(num_envs=1, max_steps=500, fen_file=fen_file, fen_curric_pct=1.0)
 env.reset(seed=42)
 
-white_obs = get_obs(env, 0)
-board = white_obs[OBS_BOARD:OBS_BOARD + 64]
+obs = get_obs(env)
+board = obs[OBS_BOARD:OBS_BOARD + 64]
 
 # e5 pawn should be on row 4, col 4 = square 36
 check("EP: e5 white pawn", board[make_sq(4, 4)] == WP,
@@ -203,7 +207,7 @@ check("EP: d5 black pawn", board[make_sq(4, 3)] == BP,
       f"got piece {board[make_sq(4, 3)]} at d5")
 
 # En passant: file should be 5 (f-file) - obs[70] = file index
-ep_file = white_obs[OBS_EP]
+ep_file = obs[OBS_EP]
 check("EP: en passant file is f (5)", ep_file == 5, f"got ep_file={ep_file}")
 
 env.close()
@@ -222,8 +226,8 @@ fen_file = write_fen_file([kings_only_fen])
 # With fen_curric_pct=0.0, should never use FEN
 env = Chess(num_envs=1, max_steps=500, fen_file=fen_file, fen_curric_pct=0.0)
 env.reset(seed=42)
-white_obs = get_obs(env, 0)
-board = white_obs[OBS_BOARD:OBS_BOARD + 64]
+obs = get_obs(env)
+board = obs[OBS_BOARD:OBS_BOARD + 64]
 # Should be normal starting position with all pieces
 piece_count_no_curric = sum(1 for sq in range(64) if board[sq] != EMPTY)
 check("No curriculum: full starting position (32 pieces)",
@@ -233,8 +237,8 @@ env.close()
 # With fen_curric_pct=1.0, should always use FEN
 env = Chess(num_envs=1, max_steps=500, fen_file=fen_file, fen_curric_pct=1.0)
 env.reset(seed=42)
-white_obs = get_obs(env, 0)
-board = white_obs[OBS_BOARD:OBS_BOARD + 64]
+obs = get_obs(env)
+board = obs[OBS_BOARD:OBS_BOARD + 64]
 piece_count_curric = sum(1 for sq in range(64) if board[sq] != EMPTY)
 check("Full curriculum: kings only (2 pieces)",
       piece_count_curric == 2, f"got {piece_count_curric} pieces")
@@ -249,7 +253,6 @@ os.unlink(fen_file)
 print("\nTest 5: Material scoring via log fields")
 
 # Use max_steps=10 so games complete quickly by truncation
-# Use report_interval large enough so we can manually call vec_log
 env = Chess(num_envs=4, max_steps=10, report_interval=99999)
 env.reset(seed=42)
 
@@ -279,13 +282,11 @@ env.close()
 print("\nTest 6: Material scoring - starting position balance")
 
 # In the starting position, material should be exactly balanced
-# We test this by looking at log.material_score after a very short game
-# (truncated to 1 step - should be 0 balance)
 env = Chess(num_envs=1, max_steps=1, report_interval=1)
 env.reset(seed=42)
 
 # Step once to get truncation (max_steps=1)
-actions = np.array([PASS_ACTION, PASS_ACTION], dtype=np.int32)
+actions = np.array([0], dtype=np.int32)
 obs, rew, terms, truncs, info = env.step(actions)
 
 log = binding.vec_log(env.c_envs)
@@ -306,7 +307,6 @@ env.close()
 print("\nTest 7: Capture bonus reward shaping")
 
 # Set up a position where White can immediately capture a piece
-# Use FEN where White queen can capture on d7
 capture_fen = "rnb1kbnr/pppQpppp/8/8/8/8/PPPP1PPP/RNB1KBNR b KQkq - 0 1"
 fen_file = write_fen_file([capture_fen])
 
@@ -333,7 +333,6 @@ os.unlink(fen_file)
 # ============================================================================
 print("\nTest 8: Check bonus reward shaping")
 
-# Scholar's mate setup - White can give check
 check_fen = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1"
 fen_file = write_fen_file([check_fen])
 
@@ -352,7 +351,6 @@ os.unlink(fen_file)
 # ============================================================================
 print("\nTest 9: New log fields - full game")
 
-# Use max_steps=20 so games truncate quickly, large report_interval to accumulate
 env = Chess(num_envs=8, max_steps=20, report_interval=99999,
             reward_capture_bonus=0.01, reward_check_bonus=0.005)
 env.reset(seed=42)
@@ -370,12 +368,10 @@ if log.get('n', 0) > 0:
     check("Log has invalid_action_rate", 'invalid_action_rate' in log)
 
     iar = log['invalid_action_rate']
-    # Rate can exceed 1.0 because both players generate illegal moves per step
-    # (2 actions per step, so max theoretical rate is ~2.0 with fully random play)
     check("Invalid action rate is non-negative and bounded",
           0.0 <= iar <= 3.0, f"got {iar}")
 
-    # Material score should be bounded (max possible material diff is ~3900)
+    # Material score should be bounded
     mat = log['material_score']
     check("Material score is bounded",
           -5000 < mat < 5000, f"got {mat}")
@@ -399,8 +395,8 @@ env = Chess(num_envs=1, max_steps=500)
 env.reset(seed=42)
 
 # Initially no FENs loaded
-white_obs = get_obs(env, 0)
-board = white_obs[OBS_BOARD:OBS_BOARD + 64]
+obs = get_obs(env)
+board = obs[OBS_BOARD:OBS_BOARD + 64]
 piece_count = sum(1 for sq in range(64) if board[sq] != EMPTY)
 check("Before loading: standard position (32 pieces)",
       piece_count == 32, f"got {piece_count}")
@@ -418,8 +414,8 @@ binding.vec_set_fen_pct(env.c_envs, 1.0)
 # Reset - should now use FEN
 env.reset(seed=123)
 
-white_obs = get_obs(env, 0)
-board = white_obs[OBS_BOARD:OBS_BOARD + 64]
+obs = get_obs(env)
+board = obs[OBS_BOARD:OBS_BOARD + 64]
 piece_count = sum(1 for sq in range(64) if board[sq] != EMPTY)
 check("After loading FEN: minimal position (3 pieces)",
       piece_count == 3, f"got {piece_count}")
@@ -440,8 +436,8 @@ env = Chess(num_envs=1, max_steps=500, fen_file=fen_file, fen_curric_pct=0.0)
 env.reset(seed=42)
 
 # Should be standard position (curric_pct=0)
-white_obs = get_obs(env, 0)
-board = white_obs[OBS_BOARD:OBS_BOARD + 64]
+obs = get_obs(env)
+board = obs[OBS_BOARD:OBS_BOARD + 64]
 piece_count = sum(1 for sq in range(64) if board[sq] != EMPTY)
 check("pct=0.0: standard position (32 pieces)",
       piece_count == 32, f"got {piece_count}")
@@ -450,8 +446,8 @@ check("pct=0.0: standard position (32 pieces)",
 binding.vec_set_fen_pct(env.c_envs, 1.0)
 env.reset(seed=123)
 
-white_obs = get_obs(env, 0)
-board = white_obs[OBS_BOARD:OBS_BOARD + 64]
+obs = get_obs(env)
+board = obs[OBS_BOARD:OBS_BOARD + 64]
 piece_count = sum(1 for sq in range(64) if board[sq] != EMPTY)
 check("pct=1.0: kings only (2 pieces)",
       piece_count == 2, f"got {piece_count}")
@@ -460,8 +456,8 @@ check("pct=1.0: kings only (2 pieces)",
 binding.vec_set_fen_pct(env.c_envs, 0.0)
 env.reset(seed=456)
 
-white_obs = get_obs(env, 0)
-board = white_obs[OBS_BOARD:OBS_BOARD + 64]
+obs = get_obs(env)
+board = obs[OBS_BOARD:OBS_BOARD + 64]
 piece_count = sum(1 for sq in range(64) if board[sq] != EMPTY)
 check("pct back to 0.0: standard position (32 pieces)",
       piece_count == 32, f"got {piece_count}")
@@ -485,10 +481,10 @@ fen_file = write_fen_file(fens)
 env = Chess(num_envs=16, max_steps=500, fen_file=fen_file, fen_curric_pct=1.0)
 env.reset(seed=42)
 
-# Collect piece counts across all 16 games
+# Collect piece counts across all 16 games (1 agent per game)
 piece_counts = set()
 for g in range(16):
-    obs = get_obs(env, g * 2)  # White obs for game g
+    obs = get_obs(env, g)
     board = obs[OBS_BOARD:OBS_BOARD + 64]
     pc = sum(1 for sq in range(64) if board[sq] != EMPTY)
     piece_counts.add(pc)
@@ -515,20 +511,20 @@ env = Chess(num_envs=1, max_steps=2, fen_file=fen_file, fen_curric_pct=1.0)
 env.reset(seed=42)
 
 # The first reset should use FEN
-white_obs = get_obs(env, 0)
-board = white_obs[OBS_BOARD:OBS_BOARD + 64]
+obs = get_obs(env)
+board = obs[OBS_BOARD:OBS_BOARD + 64]
 piece_count_first = sum(1 for sq in range(64) if board[sq] != EMPTY)
 check("First reset uses FEN (2 pieces)", piece_count_first == 2,
       f"got {piece_count_first}")
 
 # Step until auto-reset happens (max_steps=2)
 for _ in range(5):
-    actions = np.array([PASS_ACTION, PASS_ACTION], dtype=np.int32)
+    actions = np.array([0], dtype=np.int32)
     obs, rew, terms, truncs, info = env.step(actions)
 
 # After auto-reset, should again use FEN
-white_obs = get_obs(env, 0)
-board = white_obs[OBS_BOARD:OBS_BOARD + 64]
+obs = get_obs(env)
+board = obs[OBS_BOARD:OBS_BOARD + 64]
 piece_count_after = sum(1 for sq in range(64) if board[sq] != EMPTY)
 check("Auto-reset also uses FEN (2 pieces)", piece_count_after == 2,
       f"got {piece_count_after}")
@@ -548,18 +544,19 @@ fen_file = write_fen_file([black_to_move_fen])
 env = Chess(num_envs=1, max_steps=500, fen_file=fen_file, fen_curric_pct=1.0)
 env.reset(seed=42)
 
-white_obs = get_obs(env, 0)
-black_obs = get_obs(env, 1)
+# In 1-agent topology, the obs is always from the mover's perspective.
+# If Black is to move, the board is flipped so the agent sees Black's pieces as "own" (1-6).
+obs = get_obs(env)
 
-check("Black to move: not White's turn", not is_my_turn(white_obs))
-check("Black to move: it's Black's turn", is_my_turn(black_obs))
+# The agent always sees it as "their turn"
+check("Black to move: mover's turn", is_my_turn(obs))
 
-# Pass should be valid for white (not their turn)
-check("Black to move: pass valid for White", white_obs[OBS_PASS_VALID] == 255)
+# pass_valid should be 0 (always mover's turn in 1-agent topology)
+check("Black to move: pass_valid is 0", obs[OBS_PASS_VALID] == 0)
 
-# Black should have valid pieces
-vp = get_valid_pieces(black_obs)
-check("Black to move: Black has valid pieces", len(vp) > 0,
+# Should have valid pieces (from Black's perspective, Black's pieces are 1-6)
+vp = get_valid_pieces(obs)
+check("Black to move: agent has valid pieces", len(vp) > 0,
       f"got {len(vp)}")
 
 env.close()

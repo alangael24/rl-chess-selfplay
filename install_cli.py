@@ -226,8 +226,8 @@ def clean():
 CHESS_PY_CONTENT = '''\
 """PufferLib Ocean Chess self-play environment.
 
-Self-play: 2 agents per game (White=even, Black=odd), same policy.
-Two-phase action system: 97 actions (pick piece, pick dest, pass).
+1-agent-per-game: each step the agent controls whoever's turn it is.
+Two-phase action system: 97 actions (pick piece, pick dest, pass[legacy]).
 """
 
 import numpy as np
@@ -261,7 +261,7 @@ class Chess(pufferlib.PufferEnv):
         self.single_action_space = gymnasium.spaces.Discrete(NUM_ACTIONS)
         self.report_interval = report_interval
         self.render_mode = render_mode
-        self.num_agents = num_envs * 2
+        self.num_agents = num_envs  # 1 agent per game
 
         super().__init__(buf=buf)
 

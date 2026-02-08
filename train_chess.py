@@ -1,12 +1,12 @@
 """Chess Self-Play Training with PufferLib.
 
-Both White and Black agents share the same policy network.
-The policy learns to play chess through self-play.
+1-agent-per-game self-play: each step, the agent controls whoever's turn it is.
+learner_color alternates each reset. Rewards are signed from learner's perspective.
 
 Two-phase action system (97 actions):
   Phase 0: Pick a piece (action 0-63 = board square)
   Phase 1: Pick destination (0-63) or promotion (64-95)
-  Action 96: PASS (valid when it's NOT this player's turn)
+  Action 96: PASS (legacy, never valid)
 
 Two ways to train:
   1. PufferLib CLI (recommended):
@@ -232,7 +232,7 @@ if __name__ == "__main__":
     args['train']['use_rnn'] = True
 
     NUM_GAMES = 2048
-    NUM_AGENTS = NUM_GAMES * 2
+    NUM_AGENTS = NUM_GAMES  # 1 agent per game
 
     vecenv = pufferlib.vector.make(
         Chess,

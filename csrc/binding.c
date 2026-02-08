@@ -1,24 +1,19 @@
 /*
  * binding.c - Custom PufferLib C binding for Chess self-play.
  *
- * Unlike the standard env_binding.h pattern (one Env per agent),
- * chess.h uses one ChessEnv per GAME that manages 2 agent slots.
+ * 1-agent-per-game topology: each game has exactly 1 agent slot.
+ * The agent controls whoever's turn it is (White or Black).
  *
- * Layout in PufferLib buffers (for N games, 2N agent slots):
- *   observations[2*i]   = White obs for game i
- *   observations[2*i+1] = Black obs for game i
- *   actions[2*i]        = White action for game i
- *   actions[2*i+1]      = Black action for game i
- *   rewards[2*i]        = White reward for game i
- *   rewards[2*i+1]      = Black reward for game i
- *   terminals[2*i]      = White terminal for game i
- *   terminals[2*i+1]    = Black terminal for game i
+ * Layout in PufferLib buffers (for N games, N agent slots):
+ *   observations[i]  = obs for game i (from current mover's perspective)
+ *   actions[i]       = action for game i
+ *   rewards[i]       = reward for game i (signed: + for learner, - for opponent)
+ *   terminals[i]     = terminal for game i
  *
- * ChessEnv.observations -> &observations[2*i * OBS_SIZE]
- * ChessEnv.actions      -> &actions[2*i]
- * ChessEnv.rewards      -> &rewards[2*i]
- * ChessEnv.terminals    -> &terminals[2*i]
- * ChessEnv.obs_stride   = OBS_SIZE (to get from white obs to black obs)
+ * ChessEnv.observations -> &observations[i * OBS_SIZE]
+ * ChessEnv.actions      -> &actions[i]
+ * ChessEnv.rewards      -> &rewards[i]
+ * ChessEnv.terminals    -> &terminals[i]
  */
 
 #include <Python.h>
@@ -29,7 +24,7 @@
 typedef struct {
     ChessEnv* games;
     int num_games;
-    int num_agents;  /* = num_games * 2 */
+    int num_agents;  /* = num_games (1 agent per game) */
     char** fen_list;
     int fen_count;
     float fen_curric_pct;
@@ -122,7 +117,7 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     /* Parse kwargs */
     int max_steps           = (int)unpack_kwarg(kwargs, "max_steps", 256);
     float illegal_penalty   = (float)unpack_kwarg(kwargs, "illegal_move_penalty", -0.1);
-    int num_games           = (int)unpack_kwarg(kwargs, "num_games", num_agents / 2);
+    int num_games           = (int)unpack_kwarg(kwargs, "num_games", num_agents);
     float reward_invalid_piece = (float)unpack_kwarg(kwargs, "reward_invalid_piece", -0.01);
     float reward_invalid_move  = (float)unpack_kwarg(kwargs, "reward_invalid_move", -0.01);
     float reward_valid_piece   = (float)unpack_kwarg(kwargs, "reward_valid_piece", 0.0);
@@ -149,9 +144,9 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         }
     }
 
-    if (num_agents != num_games * 2) {
+    if (num_agents != num_games) {
         PyErr_SetString(PyExc_ValueError,
-            "num_agents must equal num_games * 2");
+            "num_agents must equal num_games (1 agent per game)");
         return NULL;
     }
 
@@ -208,23 +203,24 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     float* rew_data          = (float*)PyArray_DATA(rewards);
     unsigned char* term_data = (unsigned char*)PyArray_DATA(terminals);
 
-    /* Wire up each game */
+    /* Initialize bitboard tables (once) */
+    if (!bitboards_initialized) init_bitboards();
+
+    /* Wire up each game: 1 agent per game */
     for (int g = 0; g < num_games; g++) {
         ChessEnv* game = &vec->games[g];
 
-        /* White = agent 2*g, Black = agent 2*g+1 */
-        int white_idx = 2 * g;
+        game->observations = obs_data + g * obs_stride_bytes;
+        game->obs_stride   = 0;  /* unused in 1-agent mode */
 
-        game->observations = obs_data + white_idx * obs_stride_bytes;
-        game->obs_stride   = obs_stride_bytes;  /* distance from white obs to black obs */
-
-        /* actions: point to the white agent slot; game reads [0] for white, [1] for black.
-         * get_action() in chess.h handles int32 vs int64 via action_itemsize. */
-        game->actions        = (char*)act_data + white_idx * act_itemsize;
+        game->actions        = (char*)act_data + g * act_itemsize;
         game->action_itemsize = act_itemsize;
 
-        game->rewards   = rew_data + white_idx;
-        game->terminals = term_data + white_idx;
+        game->rewards   = rew_data + g;
+        game->terminals = term_data + g;
+
+        /* Alternate initial learner_color across games */
+        game->learner_color = g % 2;
 
         game->rng_state = (uint64_t)(seed * num_games + g + 1);
         if (game->rng_state == 0) game->rng_state = 1;
@@ -274,13 +270,8 @@ static void vec_reset_game(VecEnv* vec, int g) {
             game->phase_state[0].pick_phase = 0;
             game->phase_state[0].selected_square = -1;
             game->phase_state[0].valid_dest_count = 0;
-            game->phase_state[1].pick_phase = 0;
-            game->phase_state[1].selected_square = -1;
-            game->phase_state[1].valid_dest_count = 0;
             game->rewards[0] = 0.0f;
-            game->rewards[1] = 0.0f;
             game->terminals[0] = 0;
-            game->terminals[1] = 0;
             /* Re-record position hash for the FEN position */
             game->position_history_count = 0;
             record_position_hash(game);
@@ -323,13 +314,8 @@ static PyObject* vec_step(PyObject* self, PyObject* args) {
                 game->phase_state[0].pick_phase = 0;
                 game->phase_state[0].selected_square = -1;
                 game->phase_state[0].valid_dest_count = 0;
-                game->phase_state[1].pick_phase = 0;
-                game->phase_state[1].selected_square = -1;
-                game->phase_state[1].valid_dest_count = 0;
                 game->rewards[0] = 0.0f;
-                game->rewards[1] = 0.0f;
                 game->terminals[0] = 0;
-                game->terminals[1] = 0;
                 /* Re-record position hash for the FEN position */
                 game->position_history_count = 0;
                 record_position_hash(game);

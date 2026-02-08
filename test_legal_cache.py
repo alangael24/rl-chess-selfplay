@@ -1,4 +1,4 @@
-"""Test suite for the legal move cache.
+"""Test suite for the legal move cache (1-agent-per-game topology).
 
 Tests:
 1. Cache hit: generate 2x without moving, same result
@@ -25,8 +25,6 @@ OBS_VALID_PIECES = 137
 OBS_VALID_DESTS = 201
 OBS_PASS_VALID = 300
 
-PASS_ACTION = 96
-
 
 def make_env(num_envs=1):
     return Chess(num_envs=num_envs, max_steps=1000,
@@ -36,7 +34,7 @@ def make_env(num_envs=1):
                  reward_valid_move=0.002)
 
 
-def get_obs(env, agent_idx):
+def get_obs(env, agent_idx=0):
     return env.observations[agent_idx]
 
 
@@ -60,10 +58,10 @@ def is_my_turn(obs):
     return obs[OBS_SIDE] == 255
 
 
-def step_with_actions(env, white_action, black_action):
+def step_action(env, action, game_idx=0):
+    """Step environment with a single action for one game."""
     actions = np.zeros(env.num_agents, dtype=np.int32)
-    actions[0] = white_action
-    actions[1] = black_action
+    actions[game_idx] = action
     return env.step(actions)
 
 
@@ -86,17 +84,16 @@ print("\nTest 1: Cache hit - same valid pieces on repeated obs reads")
 env = make_env()
 env.reset(seed=42)
 
-white_obs_1 = get_obs(env, 0).copy()
-vp1 = get_valid_pieces(white_obs_1)
+obs1 = get_obs(env).copy()
+vp1 = get_valid_pieces(obs1)
 
-# Step with pass actions (no move made, position unchanged)
-step_with_actions(env, PASS_ACTION, PASS_ACTION)
+# Step with an invalid action (position unchanged, still same mover)
+step_action(env, 63)  # likely invalid square
 
-white_obs_2 = get_obs(env, 0).copy()
-vp2 = get_valid_pieces(white_obs_2)
+obs2 = get_obs(env).copy()
+vp2 = get_valid_pieces(obs2)
 
-# White tried invalid pass (it was their turn), but position hasn't changed
-# The valid pieces should be identical
+# Position hasn't changed, valid pieces should be identical
 check("Valid pieces identical on same position (cache hit)", vp1 == vp2,
       f"first={vp1}, second={vp2}")
 check("Valid pieces are non-empty", len(vp1) > 0)
@@ -110,28 +107,25 @@ print("\nTest 2: Cache miss after a move changes the position")
 env = make_env()
 env.reset(seed=42)
 
-white_obs = get_obs(env, 0)
-vp_before = get_valid_pieces(white_obs)
+obs = get_obs(env)
+vp_before = get_valid_pieces(obs)
 
-# Make a complete White move (phase 0 + phase 1)
+# Make a complete move (phase 0 + phase 1)
 piece_sq = min(vp_before)
-step_with_actions(env, piece_sq, PASS_ACTION)  # phase 0->1
+step_action(env, piece_sq)  # phase 0->1
 
-white_obs = get_obs(env, 0)
-vd = get_valid_dests(white_obs)
+obs = get_obs(env)
+vd = get_valid_dests(obs)
 dest_sq = min(vd)
-step_with_actions(env, dest_sq, PASS_ACTION)  # phase 1->0, move executed
+step_action(env, dest_sq)  # phase 1->0, move executed
 
-# Now it's Black's turn - check Black's valid pieces
-black_obs = get_obs(env, 1)
-bvp = get_valid_pieces(black_obs)
+# Now agent 0 plays for the other side. It should have valid pieces for that side.
+obs = get_obs(env)
+new_vp = get_valid_pieces(obs)
 
-check("Black has valid pieces after White moves", len(bvp) > 0)
-check("White has no valid pieces (not their turn)",
-      len(get_valid_pieces(get_obs(env, 0))) == 0)
+check("New side has valid pieces after move", len(new_vp) > 0)
 
 # After position changed, a new generation was needed (cache miss)
-# This is implicitly verified by the fact that correct moves are returned
 check("Position changed triggers correct movegen", True)
 
 env.close()
@@ -145,50 +139,30 @@ env.reset(seed=123)
 
 moves_played = 0
 for _ in range(20):  # Play 20 env steps with valid moves
-    white_obs = get_obs(env, 0)
-    black_obs = get_obs(env, 1)
+    obs = get_obs(env)
 
-    white_action = PASS_ACTION
-    black_action = PASS_ACTION
+    phase = get_phase(obs)
+    action = 0
+    if phase == 0:
+        vp = get_valid_pieces(obs)
+        if vp:
+            action = min(vp)
+    elif phase == 1:
+        vd = get_valid_dests(obs)
+        if vd:
+            action = min(vd)
+            moves_played += 1
 
-    if is_my_turn(white_obs):
-        phase = get_phase(white_obs)
-        if phase == 0:
-            vp = get_valid_pieces(white_obs)
-            if vp:
-                white_action = min(vp)
-        elif phase == 1:
-            vd = get_valid_dests(white_obs)
-            if vd:
-                white_action = min(vd)
-                moves_played += 1
-
-    if is_my_turn(black_obs):
-        phase = get_phase(black_obs)
-        if phase == 0:
-            vp = get_valid_pieces(black_obs)
-            if vp:
-                black_action = min(vp)
-        elif phase == 1:
-            vd = get_valid_dests(black_obs)
-            if vd:
-                black_action = min(vd)
-                moves_played += 1
-
-    step_with_actions(env, white_action, black_action)
+    step_action(env, action)
 
 check("Played multiple valid moves with cache", moves_played >= 2,
       f"played {moves_played} moves")
 
 # Verify current position is consistent
-white_obs = get_obs(env, 0)
-black_obs = get_obs(env, 1)
-# Exactly one player should have valid pieces (the one whose turn it is)
-wvp = get_valid_pieces(white_obs)
-bvp = get_valid_pieces(black_obs)
-check("Exactly one side has valid pieces",
-      (len(wvp) > 0) != (len(bvp) > 0),
-      f"white={len(wvp)}, black={len(bvp)}")
+obs = get_obs(env)
+vp = get_valid_pieces(obs)
+check("Current side has valid pieces", len(vp) > 0,
+      f"got {len(vp)} valid pieces")
 
 env.close()
 
@@ -200,29 +174,29 @@ env = make_env()
 env.reset(seed=42)
 
 # Play some moves to change the position
-white_obs = get_obs(env, 0)
-vp = get_valid_pieces(white_obs)
+obs = get_obs(env)
+vp = get_valid_pieces(obs)
 piece_sq = min(vp)
-step_with_actions(env, piece_sq, PASS_ACTION)
+step_action(env, piece_sq)
 
-white_obs = get_obs(env, 0)
-vd = get_valid_dests(white_obs)
+obs = get_obs(env)
+vd = get_valid_dests(obs)
 dest_sq = min(vd)
-step_with_actions(env, dest_sq, PASS_ACTION)
+step_action(env, dest_sq)
 
 # Now reset
 env.reset(seed=99)
 
 # After reset, should be fresh starting position
-white_obs = get_obs(env, 0)
-vp_after_reset = get_valid_pieces(white_obs)
+obs = get_obs(env)
+vp_after_reset = get_valid_pieces(obs)
 
 # In starting position, White should have pieces with legal moves:
 # 8 pawns + 2 knights = 10
 check("After reset: correct number of valid pieces", len(vp_after_reset) == 10,
       f"got {len(vp_after_reset)}")
-check("After reset: White's turn", is_my_turn(white_obs))
-check("After reset: phase 0", get_phase(white_obs) == 0)
+check("After reset: mover's turn", is_my_turn(obs))
+check("After reset: phase 0", get_phase(obs) == 0)
 
 env.close()
 
@@ -235,19 +209,19 @@ env.reset(seed=42)
 
 # The first call to generate moves happens in write_observations (via compute_valid_pieces_mask)
 # during reset. Then when we pick a piece in phase 0, it should get a cache hit.
-white_obs = get_obs(env, 0)
-vp = get_valid_pieces(white_obs)
+obs = get_obs(env)
+vp = get_valid_pieces(obs)
 check("Valid pieces populated from obs (first generation)", len(vp) > 0)
 
 # Pick a valid piece - this should use cached moves
 piece_sq = min(vp)
-step_with_actions(env, piece_sq, PASS_ACTION)
+step_action(env, piece_sq)
 
-white_obs = get_obs(env, 0)
-check("Phase transition worked (cache used in phase 0)", get_phase(white_obs) == 1)
+obs = get_obs(env)
+check("Phase transition worked (cache used in phase 0)", get_phase(obs) == 1)
 
 # The dests should match what we'd expect for that piece
-vd = get_valid_dests(white_obs)
+vd = get_valid_dests(obs)
 check("Valid destinations available after piece selection", len(vd) > 0)
 
 env.close()
@@ -260,31 +234,27 @@ env = make_env()
 env.reset(seed=42)
 
 # Record valid pieces for starting position
-vp_start = get_valid_pieces(get_obs(env, 0))
+vp_start = get_valid_pieces(get_obs(env))
 
-# Make a move
+# Make a White move
 piece_sq = min(vp_start)
-step_with_actions(env, piece_sq, PASS_ACTION)
-vd = get_valid_dests(get_obs(env, 0))
-step_with_actions(env, min(vd), PASS_ACTION)
+step_action(env, piece_sq)
+vd = get_valid_dests(get_obs(env))
+step_action(env, min(vd))
 
-# Now Black moves
-black_obs = get_obs(env, 1)
-bvp = get_valid_pieces(black_obs)
-check("Black valid pieces differ from White start (different position)",
-      bvp != vp_start or True)  # always pass since different player perspectives
-
-# Make Black's move
+# Now agent plays for Black's side - make a Black move
+obs = get_obs(env)
+bvp = get_valid_pieces(obs)
 b_piece = min(bvp)
-step_with_actions(env, PASS_ACTION, b_piece)
-black_obs = get_obs(env, 1)
-bvd = get_valid_dests(black_obs)
-step_with_actions(env, PASS_ACTION, min(bvd))
+step_action(env, b_piece)
+obs = get_obs(env)
+bvd = get_valid_dests(obs)
+step_action(env, min(bvd))
 
-# Back to White - position has changed from starting
-white_obs = get_obs(env, 0)
-vp_after = get_valid_pieces(white_obs)
-check("White valid pieces after two moves differ from start",
+# Back to White's side - position has changed from starting
+obs = get_obs(env)
+vp_after = get_valid_pieces(obs)
+check("Valid pieces after two moves differ from start",
       vp_after != vp_start,
       f"start={sorted(vp_start)}, after={sorted(vp_after)}")
 
@@ -300,25 +270,23 @@ env.reset(seed=42)
 # Each game starts from the same position so valid pieces should be identical
 all_vp = []
 for g in range(4):
-    white_obs = get_obs(env, 2 * g)
-    vp = get_valid_pieces(white_obs)
+    obs = get_obs(env, g)  # 1 agent per game
+    vp = get_valid_pieces(obs)
     all_vp.append(vp)
 
 check("All 4 games have same starting valid pieces",
       all(vp == all_vp[0] for vp in all_vp))
 
 # Make different moves in different games
-actions = np.full(env.num_agents, PASS_ACTION, dtype=np.int32)
-# Game 0: pick first valid piece
-# Game 1: pick last valid piece
+actions = np.zeros(env.num_agents, dtype=np.int32)
 vp_list = sorted(all_vp[0])
-actions[0] = vp_list[0]   # Game 0 White: first piece
-actions[2] = vp_list[-1]  # Game 1 White: last piece
+actions[0] = vp_list[0]   # Game 0: first piece
+actions[1] = vp_list[-1]  # Game 1: last piece
 env.step(actions)
 
 # Check that game 0 and game 1 have different selected pieces
 obs_g0 = get_obs(env, 0)
-obs_g1 = get_obs(env, 2)
+obs_g1 = get_obs(env, 1)
 phase_g0 = get_phase(obs_g0)
 phase_g1 = get_phase(obs_g1)
 check("Game 0 in phase 1", phase_g0 == 1)
@@ -344,46 +312,26 @@ max_steps = 3000
 errors = 0
 
 while steps < max_steps:
-    white_obs = get_obs(env, 0)
-    black_obs = get_obs(env, 1)
+    obs = get_obs(env)
 
-    white_action = PASS_ACTION
-    black_action = PASS_ACTION
+    phase = get_phase(obs)
+    action = 0
+    if phase == 0:
+        vp = get_valid_pieces(obs)
+        if vp:
+            # Pick a varying valid piece
+            action = sorted(vp)[steps % len(vp)]
+        else:
+            errors += 1
+    elif phase == 1:
+        vd = get_valid_dests(obs)
+        if vd:
+            action = sorted(vd)[steps % len(vd)]
+            moves_completed += 1
+        else:
+            errors += 1
 
-    if is_my_turn(white_obs):
-        phase = get_phase(white_obs)
-        if phase == 0:
-            vp = get_valid_pieces(white_obs)
-            if vp:
-                # Pick a random valid piece
-                white_action = sorted(vp)[steps % len(vp)]
-            else:
-                errors += 1
-        elif phase == 1:
-            vd = get_valid_dests(white_obs)
-            if vd:
-                white_action = sorted(vd)[steps % len(vd)]
-                moves_completed += 1
-            else:
-                errors += 1
-
-    if is_my_turn(black_obs):
-        phase = get_phase(black_obs)
-        if phase == 0:
-            vp = get_valid_pieces(black_obs)
-            if vp:
-                black_action = sorted(vp)[steps % len(vp)]
-            else:
-                errors += 1
-        elif phase == 1:
-            vd = get_valid_dests(black_obs)
-            if vd:
-                black_action = sorted(vd)[steps % len(vd)]
-                moves_completed += 1
-            else:
-                errors += 1
-
-    obs, rew, terms, truncs, info = step_with_actions(env, white_action, black_action)
+    obs, rew, terms, truncs, info = step_action(env, action)
     steps += 1
 
     if terms[0]:

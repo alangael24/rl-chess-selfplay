@@ -1,4 +1,4 @@
-"""Test suite for draw configuration flags.
+"""Test suite for draw configuration flags (1-agent-per-game topology).
 
 Tests reward_draw, enable_50_move_rule, and enable_threefold_repetition.
 """
@@ -16,7 +16,6 @@ OBS_PHASE = 71
 OBS_VALID_PIECES = 137
 OBS_VALID_DESTS = 201
 OBS_PASS_VALID = 300
-PASS_ACTION = 96
 
 passed = 0
 failed = 0
@@ -32,7 +31,7 @@ def check(name, condition, msg=""):
         failed += 1
 
 
-def get_obs(env, agent_idx):
+def get_obs(env, agent_idx=0):
     return env.observations[agent_idx]
 
 
@@ -56,40 +55,49 @@ def get_valid_dests(obs):
     return [i for i in range(64) if obs[OBS_VALID_DESTS + i] == 255]
 
 
-def step_with_actions(env, white_action, black_action):
-    actions = np.array([white_action, black_action], dtype=np.int32)
+def step_action(env, action):
+    """Step with a single action for game 0 (1-agent topology)."""
+    actions = np.array([action], dtype=np.int32)
     return env.step(actions)
 
 
-def pick_and_move(env, player):
-    """Execute a full chess move (phase 0 + phase 1) for the given player.
+def make_move(env, from_sq, to_sq):
+    """Execute a full chess move (phase 0 + phase 1) for the current mover.
+    from_sq and to_sq are in the current mover's perspective.
     Returns True if a move was executed, False if stuck."""
-    obs = get_obs(env, player)
-    if not is_my_turn(obs):
+    obs = get_obs(env)
+    if get_phase(obs) != 0:
         return False
 
+    # Phase 0: pick a piece
+    step_action(env, from_sq)
+
+    # Phase 1: pick a destination
+    step_action(env, to_sq)
+
+    return True
+
+
+def pick_and_move(env):
+    """Execute a full chess move using the first valid piece and destination.
+    Returns True if a move was executed, False if stuck."""
+    obs = get_obs(env)
     valid_pieces = get_valid_pieces(obs)
     if not valid_pieces:
         return False
 
     # Phase 0: pick a piece
     piece_sq = valid_pieces[0]
-    if player == 0:
-        step_with_actions(env, piece_sq, PASS_ACTION)
-    else:
-        step_with_actions(env, PASS_ACTION, piece_sq)
+    step_action(env, piece_sq)
 
     # Phase 1: pick a destination
-    obs = get_obs(env, player)
+    obs = get_obs(env)
     valid_dests = get_valid_dests(obs)
     if not valid_dests:
         return False
 
     dest_sq = valid_dests[0]
-    if player == 0:
-        step_with_actions(env, dest_sq, PASS_ACTION)
-    else:
-        step_with_actions(env, PASS_ACTION, dest_sq)
+    step_action(env, dest_sq)
 
     return True
 
@@ -97,45 +105,35 @@ def pick_and_move(env, player):
 def play_knight_cycle(env, count=1):
     """Play Ng1-f3/Ng8-f6 and back to force repetition.
     Each cycle = 4 chess moves (2 per side).
+
+    In 1-agent topology, agent 0 alternates between White and Black.
+    After White moves, the board flips so agent 0 sees Black's perspective.
+    Knight positions in each perspective:
+    - White sees: g1=6, f3=21
+    - Black sees (flipped): g8=6, f6=21 (same squares in their perspective)
+
     Returns the number of completed cycles."""
-    # Square mapping:
-    # g1=6, f3=21, g8=62(abs)->flip to 6(black), f6=45(abs)->flip to 21(black)
-    # From black's perspective: g8 is flip(62)=make_sq(7-7,6)=make_sq(0,6)=6
-    # f6 is flip(45)=make_sq(7-5,5)=make_sq(2,5)=21
     for c in range(count):
-        # Check terminal
         if env.terminals[0] == 1:
             return c
 
-        # White: Ng1-f3 (g1=6, f3=21)
-        step_with_actions(env, 6, PASS_ACTION)   # pick knight at g1
-        if env.terminals[0] == 1:
-            return c
-        step_with_actions(env, 21, PASS_ACTION)  # move to f3
+        # White's turn: Ng1-f3 (pick sq 6, dest sq 21)
+        make_move(env, 6, 21)
         if env.terminals[0] == 1:
             return c
 
-        # Black: Ng8-f6 (black perspective: g8=6, f6=21)
-        step_with_actions(env, PASS_ACTION, 6)   # pick knight at g8
-        if env.terminals[0] == 1:
-            return c
-        step_with_actions(env, PASS_ACTION, 21)  # move to f6
+        # Black's turn (board flipped): Ng8-f6 (pick sq 6, dest sq 21 in Black's perspective)
+        make_move(env, 6, 21)
         if env.terminals[0] == 1:
             return c
 
-        # White: Nf3-g1 (f3=21, g1=6)
-        step_with_actions(env, 21, PASS_ACTION)  # pick knight at f3
-        if env.terminals[0] == 1:
-            return c
-        step_with_actions(env, 6, PASS_ACTION)   # move to g1
+        # White's turn: Nf3-g1 (pick sq 21, dest sq 6)
+        make_move(env, 21, 6)
         if env.terminals[0] == 1:
             return c
 
-        # Black: Nf6-g8 (black perspective: f6=21, g8=6)
-        step_with_actions(env, PASS_ACTION, 21)  # pick knight at f6
-        if env.terminals[0] == 1:
-            return c
-        step_with_actions(env, PASS_ACTION, 6)   # move to g8
+        # Black's turn (board flipped): Nf6-g8 (pick sq 21, dest sq 6 in Black's perspective)
+        make_move(env, 21, 6)
         if env.terminals[0] == 1:
             return c
 
@@ -149,19 +147,17 @@ print("\nTest 1: Default reward_draw=0.0 (backward compat)")
 # Use reward_invalid_move=0 to isolate draw reward from invalid-pass penalties
 env = Chess(num_envs=1, max_steps=10, reward_invalid_move=0.0, reward_invalid_piece=0.0)
 env.reset(seed=42)
-# Play until truncation
+# Play until truncation with invalid actions (just zeros)
 for _ in range(100):
     if env.terminals[0] == 1:
         break
-    actions = np.array([PASS_ACTION, PASS_ACTION], dtype=np.int32)
+    actions = np.array([0], dtype=np.int32)
     env.step(actions)
 
 # The env should truncate at max_steps=10. Check rewards are 0.
 check("Default draw: terminal", env.terminals[0] == 1)
-check("Default draw: reward=0 for white", env.rewards[0] == 0.0,
+check("Default draw: reward=0", env.rewards[0] == 0.0,
       f"got {env.rewards[0]}")
-check("Default draw: reward=0 for black", env.rewards[1] == 0.0,
-      f"got {env.rewards[1]}")
 env.close()
 
 # ============================================================================
@@ -174,14 +170,12 @@ env.reset(seed=42)
 for _ in range(100):
     if env.terminals[0] == 1:
         break
-    actions = np.array([PASS_ACTION, PASS_ACTION], dtype=np.int32)
+    actions = np.array([0], dtype=np.int32)
     env.step(actions)
 
 check("Positive draw reward: terminal", env.terminals[0] == 1)
-check("Positive draw reward: white=0.5", abs(env.rewards[0] - 0.5) < 0.001,
+check("Positive draw reward: agent=0.5", abs(env.rewards[0] - 0.5) < 0.001,
       f"got {env.rewards[0]}")
-check("Positive draw reward: black=0.5", abs(env.rewards[1] - 0.5) < 0.001,
-      f"got {env.rewards[1]}")
 env.close()
 
 # ============================================================================
@@ -194,14 +188,12 @@ env.reset(seed=42)
 for _ in range(100):
     if env.terminals[0] == 1:
         break
-    actions = np.array([PASS_ACTION, PASS_ACTION], dtype=np.int32)
+    actions = np.array([0], dtype=np.int32)
     env.step(actions)
 
 check("Negative draw reward: terminal", env.terminals[0] == 1)
-check("Negative draw reward: white=-0.5", abs(env.rewards[0] - (-0.5)) < 0.001,
+check("Negative draw reward: agent=-0.5", abs(env.rewards[0] - (-0.5)) < 0.001,
       f"got {env.rewards[0]}")
-check("Negative draw reward: black=-0.5", abs(env.rewards[1] - (-0.5)) < 0.001,
-      f"got {env.rewards[1]}")
 env.close()
 
 # ============================================================================
@@ -216,13 +208,10 @@ env.reset(seed=42)
 cycles = play_knight_cycle(env, count=3)
 
 check("Repetition: game terminated", env.terminals[0] == 1)
-# Rewards should include 0.3 for the draw
-check("Repetition: white reward includes draw",
+# Reward should include 0.3 for the draw
+check("Repetition: reward includes draw",
       abs(env.rewards[0] - 0.3) < 0.1 or env.rewards[0] >= 0.25,
       f"got {env.rewards[0]}")
-check("Repetition: black reward includes draw",
-      abs(env.rewards[1] - 0.3) < 0.1 or env.rewards[1] >= 0.25,
-      f"got {env.rewards[1]}")
 env.close()
 
 # ============================================================================
@@ -244,41 +233,26 @@ env.reset(seed=42)
 for _ in range(20):
     if env.terminals[0] == 1:
         break
-    obs_w = get_obs(env, 0)
-    if is_my_turn(obs_w):
-        vp = get_valid_pieces(obs_w)
-        if vp:
-            step_with_actions(env, vp[0], PASS_ACTION)
-            obs_w = get_obs(env, 0)
-            vd = get_valid_dests(obs_w)
-            if vd:
-                step_with_actions(env, vd[0], PASS_ACTION)
-            else:
-                step_with_actions(env, PASS_ACTION, PASS_ACTION)
+    obs = get_obs(env)
+    vp = get_valid_pieces(obs)
+    if vp:
+        step_action(env, vp[0])
+        obs = get_obs(env)
+        if env.terminals[0] == 1:
+            break
+        vd = get_valid_dests(obs)
+        if vd:
+            step_action(env, vd[0])
         else:
-            step_with_actions(env, PASS_ACTION, PASS_ACTION)
+            step_action(env, 0)
     else:
-        obs_b = get_obs(env, 1)
-        vp = get_valid_pieces(obs_b)
-        if vp:
-            step_with_actions(env, PASS_ACTION, vp[0])
-            obs_b = get_obs(env, 1)
-            vd = get_valid_dests(obs_b)
-            if vd:
-                step_with_actions(env, PASS_ACTION, vd[0])
-            else:
-                step_with_actions(env, PASS_ACTION, PASS_ACTION)
-        else:
-            step_with_actions(env, PASS_ACTION, PASS_ACTION)
+        step_action(env, 0)
 
 check("K vs K: game terminated", env.terminals[0] == 1)
-# Both rewards should include the draw reward
-check("K vs K: white got draw reward",
+# Reward should include the draw reward
+check("K vs K: agent got draw reward",
       abs(env.rewards[0] - 0.25) < 0.05,
       f"got {env.rewards[0]}")
-check("K vs K: black got draw reward",
-      abs(env.rewards[1] - 0.25) < 0.05,
-      f"got {env.rewards[1]}")
 env.close()
 os.remove(fen_path)
 
@@ -293,7 +267,6 @@ env.reset(seed=42)
 cycles = play_knight_cycle(env, count=4)
 
 # With threefold disabled, game should NOT have terminated from repetition
-# (may still be ongoing or terminated from something else)
 check("Threefold disabled: completed 4 cycles without repetition end",
       cycles == 4,
       f"only completed {cycles} cycles")
@@ -315,36 +288,25 @@ env_enabled = Chess(num_envs=1, max_steps=1000,
                     enable_50_move_rule=1)
 env_enabled.reset(seed=42)
 terminated_at_50 = False
-for _ in range(20):
+for _ in range(40):
     if env_enabled.terminals[0] == 1:
         terminated_at_50 = True
         break
-    obs_w = get_obs(env_enabled, 0)
-    if is_my_turn(obs_w):
-        vp = get_valid_pieces(obs_w)
-        if vp:
-            step_with_actions(env_enabled, vp[0], PASS_ACTION)
-            obs_w = get_obs(env_enabled, 0)
-            vd = get_valid_dests(obs_w)
-            if vd:
-                step_with_actions(env_enabled, vd[0], PASS_ACTION)
-            else:
-                step_with_actions(env_enabled, PASS_ACTION, PASS_ACTION)
+    obs = get_obs(env_enabled)
+    vp = get_valid_pieces(obs)
+    if vp:
+        step_action(env_enabled, vp[0])
+        obs = get_obs(env_enabled)
+        if env_enabled.terminals[0] == 1:
+            terminated_at_50 = True
+            break
+        vd = get_valid_dests(obs)
+        if vd:
+            step_action(env_enabled, vd[0])
         else:
-            step_with_actions(env_enabled, PASS_ACTION, PASS_ACTION)
+            step_action(env_enabled, 0)
     else:
-        obs_b = get_obs(env_enabled, 1)
-        vp = get_valid_pieces(obs_b)
-        if vp:
-            step_with_actions(env_enabled, PASS_ACTION, vp[0])
-            obs_b = get_obs(env_enabled, 1)
-            vd = get_valid_dests(obs_b)
-            if vd:
-                step_with_actions(env_enabled, PASS_ACTION, vd[0])
-            else:
-                step_with_actions(env_enabled, PASS_ACTION, PASS_ACTION)
-        else:
-            step_with_actions(env_enabled, PASS_ACTION, PASS_ACTION)
+        step_action(env_enabled, 0)
 
 check("50-move enabled: game terminated", terminated_at_50)
 env_enabled.close()
@@ -355,36 +317,24 @@ env_disabled = Chess(num_envs=1, max_steps=1000,
                      enable_50_move_rule=0)
 env_disabled.reset(seed=42)
 moves_without_terminal = 0
-for _ in range(20):
+for _ in range(40):
     if env_disabled.terminals[0] == 1:
         break
     moves_without_terminal += 1
-    obs_w = get_obs(env_disabled, 0)
-    if is_my_turn(obs_w):
-        vp = get_valid_pieces(obs_w)
-        if vp:
-            step_with_actions(env_disabled, vp[0], PASS_ACTION)
-            obs_w = get_obs(env_disabled, 0)
-            vd = get_valid_dests(obs_w)
-            if vd:
-                step_with_actions(env_disabled, vd[0], PASS_ACTION)
-            else:
-                step_with_actions(env_disabled, PASS_ACTION, PASS_ACTION)
+    obs = get_obs(env_disabled)
+    vp = get_valid_pieces(obs)
+    if vp:
+        step_action(env_disabled, vp[0])
+        obs = get_obs(env_disabled)
+        if env_disabled.terminals[0] == 1:
+            break
+        vd = get_valid_dests(obs)
+        if vd:
+            step_action(env_disabled, vd[0])
         else:
-            step_with_actions(env_disabled, PASS_ACTION, PASS_ACTION)
+            step_action(env_disabled, 0)
     else:
-        obs_b = get_obs(env_disabled, 1)
-        vp = get_valid_pieces(obs_b)
-        if vp:
-            step_with_actions(env_disabled, PASS_ACTION, vp[0])
-            obs_b = get_obs(env_disabled, 1)
-            vd = get_valid_dests(obs_b)
-            if vd:
-                step_with_actions(env_disabled, PASS_ACTION, vd[0])
-            else:
-                step_with_actions(env_disabled, PASS_ACTION, PASS_ACTION)
-        else:
-            step_with_actions(env_disabled, PASS_ACTION, PASS_ACTION)
+        step_action(env_disabled, 0)
 
 check("50-move disabled: survived more steps",
       moves_without_terminal > 4,
@@ -418,16 +368,13 @@ env.reset(seed=42)
 for _ in range(100):
     if env.terminals[0] == 1:
         break
-    actions = np.array([PASS_ACTION, PASS_ACTION], dtype=np.int32)
+    actions = np.array([0], dtype=np.int32)
     env.step(actions)
 
 check("Truncation with flags disabled: terminal", env.terminals[0] == 1)
-check("Truncation with flags disabled: white=-0.3",
+check("Truncation with flags disabled: reward=-0.3",
       abs(env.rewards[0] - (-0.3)) < 0.001,
       f"got {env.rewards[0]}")
-check("Truncation with flags disabled: black=-0.3",
-      abs(env.rewards[1] - (-0.3)) < 0.001,
-      f"got {env.rewards[1]}")
 env.close()
 
 # ============================================================================
@@ -441,8 +388,8 @@ env.reset(seed=42)
 cycles = play_knight_cycle(env, count=3)
 check("Defaults: repetition triggers", env.terminals[0] == 1)
 check("Defaults: no extra reward from draw",
-      abs(env.rewards[0]) < 0.01 and abs(env.rewards[1]) < 0.01,
-      f"white={env.rewards[0]}, black={env.rewards[1]}")
+      abs(env.rewards[0]) < 0.01,
+      f"reward={env.rewards[0]}")
 env.close()
 
 # ============================================================================

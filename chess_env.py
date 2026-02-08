@@ -1,15 +1,15 @@
 """PufferLib PufferEnv wrapper for Chess self-play.
 
-Self-play design:
-  - num_agents = num_envs * 2 (2 players per game: White and Black)
-  - Each game has 2 agent slots: even index = White, odd index = Black
-  - Both agents share the same policy network
-  - The C binding pairs consecutive agent slots into shared games
+1-agent-per-game topology:
+  - num_agents = num_envs (1 agent per game)
+  - Each step, the agent controls whoever's turn it is (White or Black)
+  - learner_color alternates each reset for symmetric self-play
+  - Rewards are signed: positive when learner benefits, negative when opponent does
 
 Two-phase action system (97 actions):
   Phase 0: Pick a piece (action 0-63 = board square)
   Phase 1: Pick destination (0-63) or promotion (64-95)
-  Action 96: PASS (valid when it's NOT this player's turn)
+  Action 96: PASS (legacy, never valid in 1-agent mode)
 
 Follows the patterns from PufferLib Ocean environments (Connect4, Go).
 """
@@ -45,8 +45,8 @@ class Chess(pufferlib.PufferEnv):
         self.single_action_space = gymnasium.spaces.Discrete(NUM_ACTIONS)
         self.report_interval = report_interval
         self.render_mode = render_mode
-        # 2 players per game: agent 2*i = White, agent 2*i+1 = Black
-        self.num_agents = num_envs * 2
+        # 1 agent per game: agent controls whoever's turn it is
+        self.num_agents = num_envs
 
         super().__init__(buf=buf)
 
@@ -112,7 +112,7 @@ def test_performance(timeout=10, num_envs=512):
     env = Chess(num_envs=num_envs)
     env.reset()
     tick = 0
-    num_agents = num_envs * 2
+    num_agents = num_envs  # 1 agent per game
     atn_cache = 1024
     actions = np.random.randint(0, NUM_ACTIONS, (atn_cache, num_agents))
 

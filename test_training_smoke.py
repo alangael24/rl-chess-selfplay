@@ -1,4 +1,5 @@
-"""Smoke test: verify Policy + LSTMWrapper + PuffeRL training loop works.
+"""Smoke test: verify Policy + LSTMWrapper + PuffeRL training loop works
+(1-agent-per-game topology).
 
 Tests:
 1. Policy encode/decode contract (returns 2 values each)
@@ -35,21 +36,27 @@ def check(name, condition, msg=""):
 # Test 1: Policy encode/decode contract
 # ============================================================================
 print("\nTest 1: Policy encode/decode contract")
-env = Chess(num_envs=2)
+NUM_GAMES = 2
+env = Chess(num_envs=NUM_GAMES)
 env.reset(seed=42)
+
+# In 1-agent topology: num_agents = num_envs
+NUM_AGENTS = NUM_GAMES
+check("num_agents == num_envs", env.num_agents == NUM_AGENTS,
+      f"got {env.num_agents}")
 
 base_policy = Policy(env, hidden_size=256, num_blocks=2)
 obs_tensor = torch.as_tensor(env.observations).float()
 
 hidden = base_policy.encode_observations(obs_tensor)
 check("encode_observations returns tensor", isinstance(hidden, torch.Tensor))
-check("hidden shape is (batch, hidden_size)", hidden.shape == (4, 256),
+check("hidden shape is (batch, hidden_size)", hidden.shape == (NUM_AGENTS, 256),
       f"got {hidden.shape}")
 
 logits, value = base_policy.decode_actions(hidden)
 check("decode_actions returns 2 values", True)
-check("logits shape", logits.shape == (4, NUM_ACTIONS), f"got {logits.shape}")
-check("value shape", value.shape == (4, 1), f"got {value.shape}")
+check("logits shape", logits.shape == (NUM_AGENTS, NUM_ACTIONS), f"got {logits.shape}")
+check("value shape", value.shape == (NUM_AGENTS, 1), f"got {value.shape}")
 
 # forward_eval also returns 2
 out = base_policy.forward_eval(obs_tensor)
@@ -61,7 +68,7 @@ env.close()
 # Test 2: LSTMWrapper forward_eval with state dict
 # ============================================================================
 print("\nTest 2: LSTMWrapper forward_eval with state dict (PufferLib contract)")
-env = Chess(num_envs=2)
+env = Chess(num_envs=NUM_GAMES)
 env.reset(seed=42)
 
 base_policy = Policy(env, hidden_size=256, num_blocks=2)
@@ -96,7 +103,7 @@ env.close()
 # Test 3: LSTMWrapper forward (training path)
 # ============================================================================
 print("\nTest 3: LSTMWrapper forward (training path with time batching)")
-env = Chess(num_envs=2)
+env = Chess(num_envs=NUM_GAMES)
 env.reset(seed=42)
 
 base_policy = Policy(env, hidden_size=256, num_blocks=2)

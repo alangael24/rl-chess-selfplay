@@ -1,4 +1,5 @@
-"""Test suite for SEE (Static Exchange Evaluation) and hanging piece reward shaping.
+"""Test suite for SEE (Static Exchange Evaluation) and hanging piece reward shaping
+(1-agent-per-game topology).
 
 Tests:
 1. SEE positive: QxP undefended - no penalty
@@ -27,8 +28,6 @@ OBS_VALID_PIECES = 137
 OBS_VALID_DESTS = 201
 OBS_PASS_VALID = 300
 
-PASS_ACTION = 96
-
 
 def make_env(num_envs=1, **kwargs):
     defaults = dict(
@@ -42,7 +41,7 @@ def make_env(num_envs=1, **kwargs):
     return Chess(num_envs=num_envs, **defaults)
 
 
-def get_obs(env, agent_idx):
+def get_obs(env, agent_idx=0):
     return env.observations[agent_idx]
 
 
@@ -66,25 +65,18 @@ def is_my_turn(obs):
     return obs[OBS_SIDE] == 255
 
 
-def step_with_actions(env, white_action, black_action):
+def step_action(env, action, game_idx=0):
+    """Step environment with a single action for one game."""
     actions = np.zeros(env.num_agents, dtype=np.int32)
-    actions[0] = white_action
-    actions[1] = black_action
+    actions[game_idx] = action
     return env.step(actions)
 
 
-def play_move(env, player, piece_sq, dest_sq):
-    """Execute a two-phase move for a player. Returns reward delta."""
-    reward_before = float(env.rewards[player])
-
-    if player == 0:
-        step_with_actions(env, piece_sq, PASS_ACTION)  # phase 0
-        step_with_actions(env, dest_sq, PASS_ACTION)    # phase 1
-    else:
-        step_with_actions(env, PASS_ACTION, piece_sq)   # phase 0
-        step_with_actions(env, PASS_ACTION, dest_sq)    # phase 1
-
-    return float(env.rewards[player])
+def play_move(env, piece_sq, dest_sq):
+    """Execute a two-phase move for the current mover. Returns the reward."""
+    step_action(env, piece_sq)   # phase 0
+    step_action(env, dest_sq)    # phase 1
+    return float(env.rewards[0])
 
 
 def flip_sq(sq):
@@ -115,27 +107,16 @@ env.reset(seed=42)
 
 # Play some random valid moves, verify no crash
 for _ in range(20):
-    white_obs = get_obs(env, 0)
-    black_obs = get_obs(env, 1)
-    wa = PASS_ACTION
-    ba = PASS_ACTION
-    if is_my_turn(white_obs):
-        phase = get_phase(white_obs)
-        if phase == 0:
-            vp = get_valid_pieces(white_obs)
-            if vp: wa = min(vp)
-        elif phase == 1:
-            vd = get_valid_dests(white_obs)
-            if vd: wa = min(vd)
-    if is_my_turn(black_obs):
-        phase = get_phase(black_obs)
-        if phase == 0:
-            vp = get_valid_pieces(black_obs)
-            if vp: ba = min(vp)
-        elif phase == 1:
-            vd = get_valid_dests(black_obs)
-            if vd: ba = min(vd)
-    step_with_actions(env, wa, ba)
+    obs = get_obs(env)
+    action = 0
+    phase = get_phase(obs)
+    if phase == 0:
+        vp = get_valid_pieces(obs)
+        if vp: action = min(vp)
+    elif phase == 1:
+        vd = get_valid_dests(obs)
+        if vd: action = min(vd)
+    step_action(env, action)
 
 check("No crash with SEE disabled", True)
 env.close()
@@ -148,27 +129,16 @@ env = make_env(reward_see_hanging=-0.01, reward_material=0.1)
 env.reset(seed=42)
 
 for _ in range(20):
-    white_obs = get_obs(env, 0)
-    black_obs = get_obs(env, 1)
-    wa = PASS_ACTION
-    ba = PASS_ACTION
-    if is_my_turn(white_obs):
-        phase = get_phase(white_obs)
-        if phase == 0:
-            vp = get_valid_pieces(white_obs)
-            if vp: wa = min(vp)
-        elif phase == 1:
-            vd = get_valid_dests(white_obs)
-            if vd: wa = min(vd)
-    if is_my_turn(black_obs):
-        phase = get_phase(black_obs)
-        if phase == 0:
-            vp = get_valid_pieces(black_obs)
-            if vp: ba = min(vp)
-        elif phase == 1:
-            vd = get_valid_dests(black_obs)
-            if vd: ba = min(vd)
-    step_with_actions(env, wa, ba)
+    obs = get_obs(env)
+    action = 0
+    phase = get_phase(obs)
+    if phase == 0:
+        vp = get_valid_pieces(obs)
+        if vp: action = min(vp)
+    elif phase == 1:
+        vd = get_valid_dests(obs)
+        if vd: action = min(vd)
+    step_action(env, action)
 
 check("No crash with SEE enabled", True)
 env.close()
@@ -177,8 +147,6 @@ env.close()
 # Test 3: Safe capture - no hanging penalty
 # ============================================================================
 print("\nTest 3: Safe capture gets no hanging penalty")
-# Compare: same capture with and without SEE penalty
-# Use high material reward to detect if it gets suppressed
 
 # With SEE enabled
 env_see = make_env(reward_see_hanging=-0.1, reward_material=0.1)
@@ -193,40 +161,23 @@ moves_played = 0
 total_reward_see = 0.0
 total_reward_nosee = 0.0
 for _ in range(40):
-    white_obs = get_obs(env_see, 0)
-    black_obs = get_obs(env_see, 1)
-    wa = PASS_ACTION
-    ba = PASS_ACTION
-    if is_my_turn(white_obs):
-        phase = get_phase(white_obs)
-        if phase == 0:
-            vp = get_valid_pieces(white_obs)
-            if vp: wa = min(vp)
-        elif phase == 1:
-            vd = get_valid_dests(white_obs)
-            if vd:
-                wa = min(vd)
-                moves_played += 1
-    if is_my_turn(black_obs):
-        phase = get_phase(black_obs)
-        if phase == 0:
-            vp = get_valid_pieces(black_obs)
-            if vp: ba = min(vp)
-        elif phase == 1:
-            vd = get_valid_dests(black_obs)
-            if vd:
-                ba = min(vd)
-                moves_played += 1
-    step_with_actions(env_see, wa, ba)
-    step_with_actions(env_nosee, wa, ba)
-    total_reward_see += env_see.rewards[0] + env_see.rewards[1]
-    total_reward_nosee += env_nosee.rewards[0] + env_nosee.rewards[1]
+    obs = get_obs(env_see)
+    action = 0
+    phase = get_phase(obs)
+    if phase == 0:
+        vp = get_valid_pieces(obs)
+        if vp: action = min(vp)
+    elif phase == 1:
+        vd = get_valid_dests(obs)
+        if vd:
+            action = min(vd)
+            moves_played += 1
+    step_action(env_see, action)
+    step_action(env_nosee, action)
+    total_reward_see += env_see.rewards[0]
+    total_reward_nosee += env_nosee.rewards[0]
 
-# Safe quiet moves (like opening pawn moves) should not be penalized
-# Total reward shouldn't be drastically different
 check("Played some moves", moves_played > 0, f"played {moves_played}")
-# Note: SEE can penalize some moves that happen to be to attacked squares,
-# so we just verify no crash and reasonable behavior
 check("Rewards are finite with SEE", np.isfinite(total_reward_see))
 
 env_see.close()
@@ -236,37 +187,25 @@ env_nosee.close()
 # Test 4: Hanging penalty is negative
 # ============================================================================
 print("\nTest 4: Hanging penalty direction is correct")
-# The reward_see_hanging should be negative (it's a penalty)
 env = make_env(reward_see_hanging=-0.05, reward_material=0.0)
 env.reset(seed=42)
 
-# Play a full game with random but valid moves, accumulate rewards
+# Play a full game with varying valid moves, accumulate rewards
 total_negative_deltas = 0
 steps = 0
 for _ in range(200):
-    white_obs = get_obs(env, 0)
-    black_obs = get_obs(env, 1)
-    wa = PASS_ACTION
-    ba = PASS_ACTION
-    if is_my_turn(white_obs):
-        phase = get_phase(white_obs)
-        if phase == 0:
-            vp = get_valid_pieces(white_obs)
-            if vp: wa = sorted(vp)[steps % len(vp)]
-        elif phase == 1:
-            vd = get_valid_dests(white_obs)
-            if vd: wa = sorted(vd)[steps % len(vd)]
-    if is_my_turn(black_obs):
-        phase = get_phase(black_obs)
-        if phase == 0:
-            vp = get_valid_pieces(black_obs)
-            if vp: ba = sorted(vp)[steps % len(vp)]
-        elif phase == 1:
-            vd = get_valid_dests(black_obs)
-            if vd: ba = sorted(vd)[steps % len(vd)]
-    step_with_actions(env, wa, ba)
+    obs = get_obs(env)
+    action = 0
+    phase = get_phase(obs)
+    if phase == 0:
+        vp = get_valid_pieces(obs)
+        if vp: action = sorted(vp)[steps % len(vp)]
+    elif phase == 1:
+        vd = get_valid_dests(obs)
+        if vd: action = sorted(vd)[steps % len(vd)]
+    step_action(env, action)
     # SEE penalty should produce negative rewards (from hanging penalty)
-    if env.rewards[0] < -0.001 or env.rewards[1] < -0.001:
+    if env.rewards[0] < -0.001:
         total_negative_deltas += 1
     steps += 1
     if env.terminals[0]:
@@ -288,27 +227,16 @@ env.reset(seed=42)
 
 any_nonzero = False
 for _ in range(100):
-    white_obs = get_obs(env, 0)
-    black_obs = get_obs(env, 1)
-    wa = PASS_ACTION
-    ba = PASS_ACTION
-    if is_my_turn(white_obs):
-        phase = get_phase(white_obs)
-        if phase == 0:
-            vp = get_valid_pieces(white_obs)
-            if vp: wa = min(vp)
-        elif phase == 1:
-            vd = get_valid_dests(white_obs)
-            if vd: wa = min(vd)
-    if is_my_turn(black_obs):
-        phase = get_phase(black_obs)
-        if phase == 0:
-            vp = get_valid_pieces(black_obs)
-            if vp: ba = min(vp)
-        elif phase == 1:
-            vd = get_valid_dests(black_obs)
-            if vd: ba = min(vd)
-    step_with_actions(env, wa, ba)
+    obs = get_obs(env)
+    action = 0
+    phase = get_phase(obs)
+    if phase == 0:
+        vp = get_valid_pieces(obs)
+        if vp: action = min(vp)
+    elif phase == 1:
+        vd = get_valid_dests(obs)
+        if vd: action = min(vd)
+    step_action(env, action)
     # With all reward shaping at 0, rewards should only come from
     # invalid piece/move penalties or win/loss
     if abs(env.rewards[0]) > 0.001 and not env.terminals[0]:
@@ -330,27 +258,16 @@ env.reset(seed=42)
 # Just verify it runs correctly for many steps
 steps = 0
 for _ in range(500):
-    white_obs = get_obs(env, 0)
-    black_obs = get_obs(env, 1)
-    wa = PASS_ACTION
-    ba = PASS_ACTION
-    if is_my_turn(white_obs):
-        phase = get_phase(white_obs)
-        if phase == 0:
-            vp = get_valid_pieces(white_obs)
-            if vp: wa = sorted(vp)[steps % len(vp)]
-        elif phase == 1:
-            vd = get_valid_dests(white_obs)
-            if vd: wa = sorted(vd)[steps % len(vd)]
-    if is_my_turn(black_obs):
-        phase = get_phase(black_obs)
-        if phase == 0:
-            vp = get_valid_pieces(black_obs)
-            if vp: ba = sorted(vp)[steps % len(vp)]
-        elif phase == 1:
-            vd = get_valid_dests(black_obs)
-            if vd: ba = sorted(vd)[steps % len(vd)]
-    step_with_actions(env, wa, ba)
+    obs = get_obs(env)
+    action = 0
+    phase = get_phase(obs)
+    if phase == 0:
+        vp = get_valid_pieces(obs)
+        if vp: action = sorted(vp)[steps % len(vp)]
+    elif phase == 1:
+        vd = get_valid_dests(obs)
+        if vd: action = sorted(vd)[steps % len(vd)]
+    step_action(env, action)
     steps += 1
     if env.terminals[0]:
         break
@@ -383,31 +300,19 @@ env.reset(seed=42)
 
 max_abs_reward = 0.0
 for _ in range(300):
-    white_obs = get_obs(env, 0)
-    black_obs = get_obs(env, 1)
-    wa = PASS_ACTION
-    ba = PASS_ACTION
-    if is_my_turn(white_obs):
-        phase = get_phase(white_obs)
-        if phase == 0:
-            vp = get_valid_pieces(white_obs)
-            if vp: wa = sorted(vp)[0]
-        elif phase == 1:
-            vd = get_valid_dests(white_obs)
-            if vd: wa = sorted(vd)[0]
-    if is_my_turn(black_obs):
-        phase = get_phase(black_obs)
-        if phase == 0:
-            vp = get_valid_pieces(black_obs)
-            if vp: ba = sorted(vp)[0]
-        elif phase == 1:
-            vd = get_valid_dests(black_obs)
-            if vd: ba = sorted(vd)[0]
-    step_with_actions(env, wa, ba)
-    for p in range(2):
-        ar = abs(env.rewards[p])
-        if ar > max_abs_reward:
-            max_abs_reward = ar
+    obs = get_obs(env)
+    action = 0
+    phase = get_phase(obs)
+    if phase == 0:
+        vp = get_valid_pieces(obs)
+        if vp: action = sorted(vp)[0]
+    elif phase == 1:
+        vd = get_valid_dests(obs)
+        if vd: action = sorted(vd)[0]
+    step_action(env, action)
+    ar = abs(env.rewards[0])
+    if ar > max_abs_reward:
+        max_abs_reward = ar
     if env.terminals[0]:
         break
 
@@ -442,33 +347,22 @@ env_nosee.reset(seed=42)
 
 # Play identical moves in both environments
 for step in range(500):
-    white_obs_see = get_obs(env_see, 0)
-    black_obs_see = get_obs(env_see, 1)
-    wa = PASS_ACTION
-    ba = PASS_ACTION
-    if is_my_turn(white_obs_see):
-        phase = get_phase(white_obs_see)
-        if phase == 0:
-            vp = get_valid_pieces(white_obs_see)
-            if vp: wa = min(vp)
-        elif phase == 1:
-            vd = get_valid_dests(white_obs_see)
-            if vd: wa = min(vd)
-    if is_my_turn(black_obs_see):
-        phase = get_phase(black_obs_see)
-        if phase == 0:
-            vp = get_valid_pieces(black_obs_see)
-            if vp: ba = min(vp)
-        elif phase == 1:
-            vd = get_valid_dests(black_obs_see)
-            if vd: ba = min(vd)
+    obs_see = get_obs(env_see)
+    action = 0
+    phase = get_phase(obs_see)
+    if phase == 0:
+        vp = get_valid_pieces(obs_see)
+        if vp: action = min(vp)
+    elif phase == 1:
+        vd = get_valid_dests(obs_see)
+        if vd: action = min(vd)
 
-    step_with_actions(env_see, wa, ba)
-    step_with_actions(env_nosee, wa, ba)
+    step_action(env_see, action)
+    step_action(env_nosee, action)
 
     # Board state should be identical
-    see_board = get_obs(env_see, 0)[OBS_BOARD:OBS_BOARD+64]
-    nosee_board = get_obs(env_nosee, 0)[OBS_BOARD:OBS_BOARD+64]
+    see_board = get_obs(env_see)[OBS_BOARD:OBS_BOARD+64]
+    nosee_board = get_obs(env_nosee)[OBS_BOARD:OBS_BOARD+64]
     if not np.array_equal(see_board, nosee_board):
         check("Boards stay in sync", False, f"diverged at step {step}")
         break

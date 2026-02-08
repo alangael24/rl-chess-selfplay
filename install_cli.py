@@ -407,46 +407,41 @@ CHESS_OBS_RULE50 = 299
 CHESS_OBS_PASS_VALID = 300
 
 
-class ChessResidualBlock(nn.Module):
-    def __init__(self, c):
-        super().__init__()
-        self.conv1 = nn.Conv2d(c, c, kernel_size=3, padding=1, bias=False)
-        self.conv2 = nn.Conv2d(c, c, kernel_size=3, padding=1, bias=False)
-        self.gn1 = nn.GroupNorm(8, c)
-        self.gn2 = nn.GroupNorm(8, c)
-
-    def forward(self, x):
-        y = F.relu(self.gn1(self.conv1(x)))
-        y = self.gn2(self.conv2(y))
-        return F.relu(y + x)
-
-
 class Chess(nn.Module):
-    def __init__(self, env, hidden_size=256, num_blocks=2, **kwargs):
+    def __init__(self, env, hidden_size=256, cnn_channels=64, embed_dim=16, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
         self.is_continuous = False
 
-        conv_in = CHESS_NUM_PIECE_TYPES + 3
-        conv_channels = 64
-        self.board_stem = nn.Conv2d(
-            conv_in, conv_channels, kernel_size=3, padding=1, bias=False)
-        self.board_gn = nn.GroupNorm(8, conv_channels)
-        self.board_blocks = nn.ModuleList([
-            ChessResidualBlock(conv_channels) for _ in range(num_blocks)
-        ])
-        self.board_proj = pufferlib.pytorch.layer_init(
-            nn.Linear(conv_channels * 8 * 8, hidden_size))
+        spatial_in = CHESS_NUM_PIECE_TYPES + 3
+        self.spatial_cnn = nn.Sequential(
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(spatial_in, cnn_channels, kernel_size=3, stride=2, padding=1)),
+            nn.ReLU(),
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, stride=2, padding=1)),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        spatial_flat = cnn_channels * 4
+
+        self.side_embed = nn.Embedding(2, embed_dim)
+        self.castle_embed = nn.Embedding(16, embed_dim)
+        self.ep_embed = nn.Embedding(65, embed_dim)
+        self.phase_embed = nn.Embedding(2, embed_dim)
 
         self.scalar_encoder = nn.Sequential(
-            nn.Linear(45, 128),
+            pufferlib.pytorch.layer_init(nn.Linear(36, hidden_size)),
             nn.ReLU(),
-            nn.Linear(128, 64),
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.ReLU(),
         )
 
-        self.fusion_fc = pufferlib.pytorch.layer_init(
-            nn.Linear(hidden_size + 64, hidden_size))
-        self.fusion_ln = nn.LayerNorm(hidden_size)
+        total_features = spatial_flat + 4 * embed_dim + hidden_size
+        self.fusion_fc = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(total_features, hidden_size)),
+            nn.ReLU(),
+        )
 
         self.actor = pufferlib.pytorch.layer_init(
             nn.Linear(hidden_size, CHESS_NUM_ACTIONS), std=0.01)
@@ -459,9 +454,6 @@ class Chess(nn.Module):
         batch_size = x.shape[0]
 
         board = x[:, CHESS_OBS_BOARD:CHESS_OBS_BOARD + 64].long()
-        side = x[:, CHESS_OBS_SIDE:CHESS_OBS_SIDE + 2].float() / 255.0
-        castling = x[:, CHESS_OBS_CASTLING:CHESS_OBS_CASTLING + 4].float() / 255.0
-        ep = x[:, CHESS_OBS_EP:CHESS_OBS_EP + 1].float() / 255.0
         phase = x[:, CHESS_OBS_PHASE:CHESS_OBS_PHASE + 2].float() / 255.0
         selected = x[:, CHESS_OBS_SELECTED:CHESS_OBS_SELECTED + 64].float() / 255.0
         valid_pieces = x[:, CHESS_OBS_VALID_PIECES:CHESS_OBS_VALID_PIECES + 64].float() / 255.0
@@ -476,26 +468,41 @@ class Chess(nn.Module):
         board_oh = F.one_hot(board, num_classes=CHESS_NUM_PIECE_TYPES).float()
         board_oh = board_oh.view(batch_size, 8, 8, CHESS_NUM_PIECE_TYPES).permute(0, 3, 1, 2)
 
+        sp_plane = selected.view(batch_size, 1, 8, 8)
         vp_plane = valid_pieces.view(batch_size, 1, 8, 8)
         vd_plane = valid_dests.view(batch_size, 1, 8, 8)
-        sp_plane = selected.view(batch_size, 1, 8, 8)
+        spatial = torch.cat([board_oh, sp_plane, vp_plane, vd_plane], dim=1)
+        spatial_feat = self.spatial_cnn(spatial)
 
-        spatial = torch.cat([board_oh, vp_plane, vd_plane, sp_plane], dim=1)
+        side_idx = x[:, CHESS_OBS_SIDE:CHESS_OBS_SIDE + 2].argmax(dim=1).long()
+        castling_bits = (x[:, CHESS_OBS_CASTLING:CHESS_OBS_CASTLING + 4] > 0).long()
+        castling_idx = (
+            castling_bits[:, 0]
+            + 2 * castling_bits[:, 1]
+            + 4 * castling_bits[:, 2]
+            + 8 * castling_bits[:, 3]
+        ).long()
+        ep_raw = x[:, CHESS_OBS_EP].long()
+        ep_idx = torch.where(
+            ep_raw == 255,
+            torch.full_like(ep_raw, 64),
+            torch.clamp(ep_raw, 0, 7),
+        )
+        phase_idx = x[:, CHESS_OBS_PHASE:CHESS_OBS_PHASE + 2].argmax(dim=1).long()
 
-        board_x = F.relu(self.board_gn(self.board_stem(spatial)))
-        for block in self.board_blocks:
-            board_x = block(board_x)
+        side_feat = self.side_embed(side_idx)
+        castle_feat = self.castle_embed(castling_idx)
+        ep_feat = self.ep_embed(ep_idx)
+        phase_feat = self.phase_embed(phase_idx)
 
-        board_feat = board_x.reshape(batch_size, -1)
-        board_feat = F.relu(self.board_proj(board_feat))
+        scalar_in = torch.cat([self_check, opp_check, rule50, pass_valid, valid_promos], dim=1)
+        scalar_feat = self.scalar_encoder(scalar_in)
 
-        scalars = torch.cat([side, castling, ep, phase, self_check, opp_check, rule50, pass_valid, valid_promos], dim=1)
-        scalar_feat = self.scalar_encoder(scalars)
+        combined = torch.cat(
+            [spatial_feat, side_feat, castle_feat, ep_feat, phase_feat, scalar_feat], dim=1
+        )
+        hidden = self.fusion_fc(combined)
 
-        combined = torch.cat([board_feat, scalar_feat], dim=1)
-        hidden = F.relu(self.fusion_ln(self.fusion_fc(combined)))
-
-        # Store action mask for decode_actions
         is_phase0 = phase[:, 0:1] > 0.5
         mask = torch.zeros(batch_size, CHESS_NUM_ACTIONS, device=x.device, dtype=torch.bool)
         vp_bool = valid_pieces > 0.5
@@ -515,9 +522,7 @@ class Chess(nn.Module):
 
         if self._action_mask is not None:
             mask = self._action_mask
-            if mask.shape[0] != logits.shape[0]:
-                mask = None
-            else:
+            if mask.shape[0] == logits.shape[0]:
                 masked_logits = logits.masked_fill(~mask, -1e9)
                 all_masked = ~mask.any(dim=1)
                 if all_masked.any():

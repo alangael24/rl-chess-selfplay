@@ -49,72 +49,57 @@ OBS_RULE50 = 299        # 1 byte
 OBS_PASS_VALID = 300    # 1 byte
 
 
-class ResidualBlock(nn.Module):
-    def __init__(self, c):
-        super().__init__()
-        self.conv1 = nn.Conv2d(c, c, kernel_size=3, padding=1, bias=False)
-        self.conv2 = nn.Conv2d(c, c, kernel_size=3, padding=1, bias=False)
-        self.gn1 = nn.GroupNorm(8, c)
-        self.gn2 = nn.GroupNorm(8, c)
-
-    def forward(self, x):
-        y = F.relu(self.gn1(self.conv1(x)))
-        y = self.gn2(self.conv2(y))
-        return F.relu(y + x)
-
-
 class Policy(nn.Module):
-    """Chess policy following PufferLib's encode/decode pattern.
-
-    Implements encode_observations() and decode_actions() so it can be
-    wrapped by pufferlib.models.LSTMWrapper for recurrence.
-    Action masking data is stored during encode_observations and used
-    in decode_actions.
-    """
-    def __init__(self, env, hidden_size=256, num_blocks=2):
+    """Lightweight fighter-style policy for higher throughput."""
+    def __init__(self, env, hidden_size=256, cnn_channels=64, embed_dim=16, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
         self.is_continuous = False
 
-        # CNN input: 13 board channels + 3 spatial channels
-        conv_in = NUM_PIECE_TYPES + 3
-        conv_channels = 64
-        self.board_stem = nn.Conv2d(
-            conv_in, conv_channels, kernel_size=3, padding=1, bias=False)
-        self.board_gn = nn.GroupNorm(8, conv_channels)
-        self.board_blocks = nn.ModuleList([
-            ResidualBlock(conv_channels) for _ in range(num_blocks)
-        ])
-        self.board_proj = pufferlib.pytorch.layer_init(
-            nn.Linear(conv_channels * 8 * 8, hidden_size))
-
-        # Scalar features: side(2) + castling(4) + ep(1) + phase(2) + check(2) + rule50(1) + pass_valid(1) + promos(32) = 45
-        self.scalar_encoder = nn.Sequential(
-            nn.Linear(45, 128),
+        # 13 board one-hot + selected + valid_pieces + valid_dests = 16 channels.
+        spatial_in = NUM_PIECE_TYPES + 3
+        self.spatial_cnn = nn.Sequential(
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(spatial_in, cnn_channels, kernel_size=3, stride=2, padding=1)),
             nn.ReLU(),
-            nn.Linear(128, 64),
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, stride=2, padding=1)),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        # 8x8 -> 4x4 -> 2x2 => cnn_channels * 4.
+        spatial_flat = cnn_channels * 4
+
+        self.side_embed = nn.Embedding(2, embed_dim)
+        self.castle_embed = nn.Embedding(16, embed_dim)
+        self.ep_embed = nn.Embedding(65, embed_dim)  # 0-7 files + 64 as "none"
+        self.phase_embed = nn.Embedding(2, embed_dim)
+
+        # scalar: self_check + opp_check + rule50 + pass_valid + valid_promos(32) = 36
+        self.scalar_encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(36, hidden_size)),
+            nn.ReLU(),
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.ReLU(),
         )
 
-        self.fusion_fc = pufferlib.pytorch.layer_init(
-            nn.Linear(hidden_size + 64, hidden_size))
-        self.fusion_ln = nn.LayerNorm(hidden_size)
+        total_features = spatial_flat + 4 * embed_dim + hidden_size
+        self.fusion_fc = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(total_features, hidden_size)),
+            nn.ReLU(),
+        )
 
         self.actor = pufferlib.pytorch.layer_init(
             nn.Linear(hidden_size, NUM_ACTIONS), std=0.01)
         self.critic = pufferlib.pytorch.layer_init(
             nn.Linear(hidden_size, 1), std=1.0)
 
-        # Action mask stored during encode_observations for use in decode_actions
         self._action_mask = None
 
     def encode_observations(self, x, state=None):
         batch_size = x.shape[0]
 
-        # Parse observation
         board = x[:, OBS_BOARD:OBS_BOARD + 64].long()
-        side = x[:, OBS_SIDE:OBS_SIDE + 2].float() / 255.0
-        castling = x[:, OBS_CASTLING:OBS_CASTLING + 4].float() / 255.0
-        ep = x[:, OBS_EP:OBS_EP + 1].float() / 255.0
         phase = x[:, OBS_PHASE:OBS_PHASE + 2].float() / 255.0
         selected = x[:, OBS_SELECTED:OBS_SELECTED + 64].float() / 255.0
         valid_pieces = x[:, OBS_VALID_PIECES:OBS_VALID_PIECES + 64].float() / 255.0
@@ -125,7 +110,6 @@ class Policy(nn.Module):
         rule50 = x[:, OBS_RULE50:OBS_RULE50 + 1].float() / 255.0
         pass_valid = x[:, OBS_PASS_VALID:OBS_PASS_VALID + 1].float() / 255.0
 
-        # Board one-hot -> 13 channels 8x8
         board = torch.clamp(board, 0, NUM_PIECE_TYPES - 1)
         board_oh = F.one_hot(board, num_classes=NUM_PIECE_TYPES).float()
         board_oh = board_oh.view(batch_size, 8, 8, NUM_PIECE_TYPES).permute(0, 3, 1, 2)
@@ -135,23 +119,36 @@ class Policy(nn.Module):
         vd_plane = valid_dests.view(batch_size, 1, 8, 8)
         sp_plane = selected.view(batch_size, 1, 8, 8)
 
-        spatial = torch.cat([board_oh, vp_plane, vd_plane, sp_plane], dim=1)
+        spatial = torch.cat([board_oh, sp_plane, vp_plane, vd_plane], dim=1)
+        spatial_feat = self.spatial_cnn(spatial)
 
-        board_x = F.relu(self.board_gn(self.board_stem(spatial)))
-        for block in self.board_blocks:
-            board_x = block(board_x)
+        side_idx = x[:, OBS_SIDE:OBS_SIDE + 2].argmax(dim=1).long()
+        castling_bits = (x[:, OBS_CASTLING:OBS_CASTLING + 4] > 0).long()
+        castling_idx = (
+            castling_bits[:, 0]
+            + 2 * castling_bits[:, 1]
+            + 4 * castling_bits[:, 2]
+            + 8 * castling_bits[:, 3]
+        ).long()
+        ep_raw = x[:, OBS_EP].long()
+        ep_idx = torch.where(
+            ep_raw == 255,
+            torch.full_like(ep_raw, 64),
+            torch.clamp(ep_raw, 0, 7),
+        )
+        phase_idx = x[:, OBS_PHASE:OBS_PHASE + 2].argmax(dim=1).long()
 
-        board_feat = board_x.reshape(batch_size, -1)
-        board_feat = F.relu(self.board_proj(board_feat))
+        side_feat = self.side_embed(side_idx)
+        castle_feat = self.castle_embed(castling_idx)
+        ep_feat = self.ep_embed(ep_idx)
+        phase_feat = self.phase_embed(phase_idx)
 
-        # Scalar features
-        scalars = torch.cat([side, castling, ep, phase, self_check, opp_check, rule50, pass_valid, valid_promos], dim=1)
-        scalar_feat = self.scalar_encoder(scalars)
+        scalar_in = torch.cat([self_check, opp_check, rule50, pass_valid, valid_promos], dim=1)
+        scalar_feat = self.scalar_encoder(scalar_in)
 
-        combined = torch.cat([board_feat, scalar_feat], dim=1)
-        hidden = F.relu(self.fusion_ln(self.fusion_fc(combined)))
+        combined = torch.cat([spatial_feat, side_feat, castle_feat, ep_feat, phase_feat, scalar_feat], dim=1)
+        hidden = self.fusion_fc(combined)
 
-        # Build and store action mask for decode_actions
         is_phase0 = phase[:, 0:1] > 0.5
         mask = torch.zeros(batch_size, NUM_ACTIONS, device=x.device, dtype=torch.bool)
         vp_bool = valid_pieces > 0.5
@@ -169,10 +166,8 @@ class Policy(nn.Module):
         logits = self.actor(hidden)
         value = self.critic(hidden)
 
-        # Apply action mask stored from encode_observations
         if self._action_mask is not None:
             mask = self._action_mask
-            # Handle batch size mismatch (training reshapes B*T)
             if mask.shape[0] != logits.shape[0]:
                 mask = None
             else:

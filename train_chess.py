@@ -248,6 +248,7 @@ if __name__ == "__main__":
         num_envs=1,
         backend=pufferlib.PufferEnv,
     )
+    vecenv.agents_per_batch = NUM_AGENTS
 
     device = args['train'].get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
     base_policy = Policy(vecenv, hidden_size=256, num_blocks=2)

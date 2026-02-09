@@ -6,14 +6,21 @@ Usage:
 """
 
 import argparse
+import os
+import sys
 import time
+
+# Allow running from git clone root without installing as a package.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 from chess_env import Chess
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--qpolicy", required=True, help="Path to quantized .qpol file")
+    parser.add_argument("--qpolicy", required=True, help="Path to native NNUE .qpol file")
     parser.add_argument("--num-envs", type=int, default=512)
     parser.add_argument("--seconds", type=float, default=5.0)
     parser.add_argument("--max-steps", type=int, default=256)

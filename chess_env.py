@@ -42,6 +42,8 @@ class Chess(pufferlib.PufferEnv):
                  reward_draw=0.0, reward_see_hanging=0.0,
                  enable_50_move_rule=1,
                  enable_threefold_repetition=1,
+                 use_native_qpolicy=0,
+                 qpolicy_path=None,
                  fen_file=None, fen_curric_pct=0.0,
                  buf=None, seed=0):
 
@@ -80,6 +82,8 @@ class Chess(pufferlib.PufferEnv):
         )
         if fen_file is not None:
             init_kwargs['fen_file'] = fen_file
+        if qpolicy_path is not None and str(qpolicy_path).strip() == "":
+            qpolicy_path = None
 
         self.c_envs = binding.vec_init(
             self.observations, self.actions, self.rewards,
@@ -90,6 +94,14 @@ class Chess(pufferlib.PufferEnv):
         )
         self.fen_curric_pct = float(fen_curric_pct)
         self.fen_file = fen_file
+        self.use_native_qpolicy = bool(int(use_native_qpolicy))
+        self.qpolicy_path = qpolicy_path
+
+        if self.use_native_qpolicy:
+            if self.qpolicy_path is None:
+                raise ValueError("use_native_qpolicy=1 requires qpolicy_path")
+            if not bool(binding.vec_load_qpolicy(self.c_envs, self.qpolicy_path)):
+                raise RuntimeError(f"Failed to load qpolicy: {self.qpolicy_path}")
 
     def reset(self, seed=None):
         self.tick = 0
@@ -97,8 +109,11 @@ class Chess(pufferlib.PufferEnv):
         return self.observations, []
 
     def step(self, actions):
-        self.actions[:] = actions
-        binding.vec_step(self.c_envs)
+        if self.use_native_qpolicy:
+            binding.vec_step_qpolicy(self.c_envs)
+        else:
+            self.actions[:] = actions
+            binding.vec_step(self.c_envs)
         self.tick += 1
 
         info = []

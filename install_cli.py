@@ -250,9 +250,9 @@ import gymnasium
 import pufferlib
 from pufferlib.ocean.chess import binding
 
-OBS_SIZE = 301    # 64 board + 2 side + 4 castling + 1 ep + 2 phase + 64 selected
-                  # + 64 valid_pieces + 64 valid_dests + 32 valid_promos
-                  # + 1 self_check + 1 opp_check + 1 rule50 + 1 pass_valid
+ACCUM_SIZE = 256
+OBS_META = 3
+OBS_SIZE = ACCUM_SIZE + OBS_META
 NUM_ACTIONS = 97  # 64 squares + 32 promotions + 1 pass
 
 
@@ -267,11 +267,12 @@ class Chess(pufferlib.PufferEnv):
                  reward_draw=0.0, reward_see_hanging=0.0,
                  enable_50_move_rule=1,
                  enable_threefold_repetition=1,
+                 use_native_qpolicy=0, qpolicy_path=None,
                  fen_file=None, fen_curric_pct=0.0,
                  buf=None, seed=0):
 
         self.single_observation_space = gymnasium.spaces.Box(
-            low=0, high=255, shape=(OBS_SIZE,), dtype=np.uint8)
+            low=-np.inf, high=np.inf, shape=(OBS_SIZE,), dtype=np.float32)
         self.single_action_space = gymnasium.spaces.Discrete(NUM_ACTIONS)
         self.report_interval = report_interval
         self.render_mode = render_mode
@@ -304,6 +305,8 @@ class Chess(pufferlib.PufferEnv):
         )
         if fen_file is not None:
             init_kwargs['fen_file'] = fen_file
+        if qpolicy_path is not None and str(qpolicy_path).strip() == '':
+            qpolicy_path = None
 
         self.c_envs = binding.vec_init(
             self.observations, self.actions, self.rewards,
@@ -313,6 +316,14 @@ class Chess(pufferlib.PufferEnv):
         )
         self.fen_curric_pct = float(fen_curric_pct)
         self.fen_file = fen_file
+        self.use_native_qpolicy = bool(int(use_native_qpolicy))
+        self.qpolicy_path = qpolicy_path
+
+        if self.use_native_qpolicy:
+            if self.qpolicy_path is None:
+                raise ValueError('use_native_qpolicy=1 requires env.qpolicy_path')
+            if not bool(binding.vec_load_qpolicy(self.c_envs, self.qpolicy_path)):
+                raise RuntimeError(f'Failed to load qpolicy: {self.qpolicy_path}')
 
     def reset(self, seed=None):
         self.tick = 0
@@ -320,14 +331,17 @@ class Chess(pufferlib.PufferEnv):
         return self.observations, []
 
     def step(self, actions):
-        self.actions[:] = actions
-        binding.vec_step(self.c_envs)
+        if self.use_native_qpolicy:
+            binding.vec_step_qpolicy(self.c_envs)
+        else:
+            self.actions[:] = actions
+            binding.vec_step(self.c_envs)
         self.tick += 1
 
         info = []
         if self.tick % self.report_interval == 0:
             log = binding.vec_log(self.c_envs)
-            if log.get("episode_length", 0) > 0:
+            if log.get('episode_length', 0) > 0:
                 info.append(log)
 
         return (self.observations, self.rewards,
@@ -348,6 +362,10 @@ class Chess(pufferlib.PufferEnv):
         pct = float(max(0.0, min(1.0, pct)))
         binding.vec_set_fen_pct(self.c_envs, pct)
         self.fen_curric_pct = pct
+
+    def load_qpolicy(self, qpolicy_path):
+        self.qpolicy_path = qpolicy_path
+        return bool(binding.vec_load_qpolicy(self.c_envs, qpolicy_path))
 '''
 
 # --- Config .ini ---
@@ -377,6 +395,8 @@ reward_draw = -0.02
 reward_see_hanging = 0.0
 enable_50_move_rule = 1
 enable_threefold_repetition = 1
+use_native_qpolicy = 0
+qpolicy_path =
 fen_file =
 fen_curric_pct = 0.0
 report_interval = 128
@@ -387,7 +407,6 @@ num_envs = 1
 
 [policy]
 hidden_size = 256
-num_blocks = 2
 
 [rnn]
 input_size = 256
@@ -396,6 +415,7 @@ hidden_size = 256
 [train]
 total_timesteps = 1_000_000_000
 precision = bfloat16
+use_rnn = False
 learning_rate = 1e-4
 ent_coef = 0.005
 gamma = 0.997
@@ -416,59 +436,29 @@ anneal_lr = True
 CHESS_POLICY_CONTENT = '''
 
 # === Chess Self-Play Policy ===
-CHESS_BOARD_SIZE = 64
-CHESS_NUM_PIECE_TYPES = 13
+CHESS_ACCUM_SIZE = 256
+CHESS_OBS_PHASE = CHESS_ACCUM_SIZE
+CHESS_OBS_LEARNER_TURN = CHESS_ACCUM_SIZE + 2
 CHESS_NUM_ACTIONS = 97
 
-# Observation layout offsets
-CHESS_OBS_BOARD = 0
-CHESS_OBS_SIDE = 64
-CHESS_OBS_CASTLING = 66
-CHESS_OBS_EP = 70
-CHESS_OBS_PHASE = 71
-CHESS_OBS_SELECTED = 73
-CHESS_OBS_VALID_PIECES = 137
-CHESS_OBS_VALID_DESTS = 201
-CHESS_OBS_VALID_PROMOS = 265
-CHESS_OBS_SELF_CHECK = 297
-CHESS_OBS_OPP_CHECK = 298
-CHESS_OBS_RULE50 = 299
-CHESS_OBS_PASS_VALID = 300
-
-
 class Chess(nn.Module):
-    def __init__(self, env, hidden_size=256, cnn_channels=64, embed_dim=16, **kwargs):
+    def __init__(self, env, hidden_size=256, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
         self.is_continuous = False
 
-        spatial_in = CHESS_NUM_PIECE_TYPES + 3
-        self.spatial_cnn = nn.Sequential(
-            pufferlib.pytorch.layer_init(
-                nn.Conv2d(spatial_in, cnn_channels, kernel_size=3, stride=2, padding=1)),
+        in_features = CHESS_ACCUM_SIZE + 3
+        self.backbone = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(in_features, hidden_size)),
             nn.ReLU(),
             pufferlib.pytorch.layer_init(
-                nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, stride=2, padding=1)),
+                nn.Linear(hidden_size, hidden_size)),
             nn.ReLU(),
-            nn.Flatten(),
-        )
-        spatial_flat = cnn_channels * 4
-
-        self.side_embed = nn.Embedding(2, embed_dim)
-        self.castle_embed = nn.Embedding(16, embed_dim)
-        self.ep_embed = nn.Embedding(65, embed_dim)
-        self.phase_embed = nn.Embedding(2, embed_dim)
-
-        self.scalar_encoder = nn.Sequential(
-            pufferlib.pytorch.layer_init(nn.Linear(36, hidden_size)),
+            pufferlib.pytorch.layer_init(
+                nn.Linear(hidden_size, hidden_size)),
             nn.ReLU(),
-            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
-            nn.ReLU(),
-        )
-
-        total_features = spatial_flat + 4 * embed_dim + hidden_size
-        self.fusion_fc = nn.Sequential(
-            pufferlib.pytorch.layer_init(nn.Linear(total_features, hidden_size)),
+            pufferlib.pytorch.layer_init(
+                nn.Linear(hidden_size, hidden_size)),
             nn.ReLU(),
         )
 
@@ -477,86 +467,31 @@ class Chess(nn.Module):
         self.critic = pufferlib.pytorch.layer_init(
             nn.Linear(hidden_size, 1), std=1.0)
 
-        self._action_mask = None
+        self._phase0 = None
 
     def encode_observations(self, x, state=None):
-        batch_size = x.shape[0]
-
-        board = x[:, CHESS_OBS_BOARD:CHESS_OBS_BOARD + 64].long()
-        phase = x[:, CHESS_OBS_PHASE:CHESS_OBS_PHASE + 2].float() / 255.0
-        selected = x[:, CHESS_OBS_SELECTED:CHESS_OBS_SELECTED + 64].float() / 255.0
-        valid_pieces = x[:, CHESS_OBS_VALID_PIECES:CHESS_OBS_VALID_PIECES + 64].float() / 255.0
-        valid_dests = x[:, CHESS_OBS_VALID_DESTS:CHESS_OBS_VALID_DESTS + 64].float() / 255.0
-        valid_promos = x[:, CHESS_OBS_VALID_PROMOS:CHESS_OBS_VALID_PROMOS + 32].float() / 255.0
-        self_check = x[:, CHESS_OBS_SELF_CHECK:CHESS_OBS_SELF_CHECK + 1].float() / 255.0
-        opp_check = x[:, CHESS_OBS_OPP_CHECK:CHESS_OBS_OPP_CHECK + 1].float() / 255.0
-        rule50 = x[:, CHESS_OBS_RULE50:CHESS_OBS_RULE50 + 1].float() / 255.0
-        pass_valid = x[:, CHESS_OBS_PASS_VALID:CHESS_OBS_PASS_VALID + 1].float() / 255.0
-
-        board = torch.clamp(board, 0, CHESS_NUM_PIECE_TYPES - 1)
-        board_oh = F.one_hot(board, num_classes=CHESS_NUM_PIECE_TYPES).float()
-        board_oh = board_oh.view(batch_size, 8, 8, CHESS_NUM_PIECE_TYPES).permute(0, 3, 1, 2)
-
-        sp_plane = selected.view(batch_size, 1, 8, 8)
-        vp_plane = valid_pieces.view(batch_size, 1, 8, 8)
-        vd_plane = valid_dests.view(batch_size, 1, 8, 8)
-        spatial = torch.cat([board_oh, sp_plane, vp_plane, vd_plane], dim=1)
-        spatial_feat = self.spatial_cnn(spatial)
-
-        side_idx = x[:, CHESS_OBS_SIDE:CHESS_OBS_SIDE + 2].argmax(dim=1).long()
-        castling_bits = (x[:, CHESS_OBS_CASTLING:CHESS_OBS_CASTLING + 4] > 0).long()
-        castling_idx = (
-            castling_bits[:, 0]
-            + 2 * castling_bits[:, 1]
-            + 4 * castling_bits[:, 2]
-            + 8 * castling_bits[:, 3]
-        ).long()
-        ep_raw = x[:, CHESS_OBS_EP].long()
-        ep_idx = torch.where(
-            ep_raw == 255,
-            torch.full_like(ep_raw, 64),
-            torch.clamp(ep_raw, 0, 7),
-        )
-        phase_idx = x[:, CHESS_OBS_PHASE:CHESS_OBS_PHASE + 2].argmax(dim=1).long()
-
-        side_feat = self.side_embed(side_idx)
-        castle_feat = self.castle_embed(castling_idx)
-        ep_feat = self.ep_embed(ep_idx)
-        phase_feat = self.phase_embed(phase_idx)
-
-        scalar_in = torch.cat([self_check, opp_check, rule50, pass_valid, valid_promos], dim=1)
-        scalar_feat = self.scalar_encoder(scalar_in)
-
-        combined = torch.cat(
-            [spatial_feat, side_feat, castle_feat, ep_feat, phase_feat, scalar_feat], dim=1
-        )
-        hidden = self.fusion_fc(combined)
-
-        is_phase0 = phase[:, 0:1] > 0.5
-        mask = torch.zeros(batch_size, CHESS_NUM_ACTIONS, device=x.device, dtype=torch.bool)
-        vp_bool = valid_pieces > 0.5
-        vd_bool = valid_dests > 0.5
-        mask[:, :64] = torch.where(is_phase0, vp_bool, vd_bool)
-        promo_bool = valid_promos > 0.5
-        mask[:, 64:96] = torch.where(is_phase0, torch.zeros_like(promo_bool), promo_bool)
-        # PASS is legacy and should remain invalid in 1-agent topology.
-        mask[:, 96] = False
-        self._action_mask = mask
-
+        accum = x[:, :CHESS_ACCUM_SIZE].float()
+        phase = x[:, CHESS_OBS_PHASE:CHESS_OBS_PHASE + 2].float()
+        learner_turn = x[:, CHESS_OBS_LEARNER_TURN:CHESS_OBS_LEARNER_TURN + 1].float()
+        model_in = torch.cat([accum, phase, learner_turn], dim=1)
+        hidden = self.backbone(model_in)
+        self._phase0 = phase[:, 0:1] > 0.5
         return hidden
 
     def decode_actions(self, hidden):
         logits = self.actor(hidden)
         value = self.critic(hidden)
 
-        if self._action_mask is not None:
-            mask = self._action_mask
-            if mask.shape[0] == logits.shape[0]:
-                masked_logits = logits.masked_fill(~mask, -1e9)
-                all_masked = ~mask.any(dim=1)
-                if all_masked.any():
-                    masked_logits[all_masked] = logits[all_masked]
-                logits = masked_logits
+        if self._phase0 is not None and self._phase0.shape[0] == logits.shape[0]:
+            logits = logits.clone()
+            logits[:, 96] = -1e9
+            promo_logits = logits[:, 64:96]
+            phase0 = self._phase0.expand_as(promo_logits)
+            logits[:, 64:96] = torch.where(
+                phase0,
+                torch.full_like(promo_logits, -1e9),
+                promo_logits,
+            )
 
         return logits, value
 

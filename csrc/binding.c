@@ -33,6 +33,77 @@ typedef struct {
     float fen_curric_pct;
 } VecEnv;
 
+#define QPOL_FILE_MAGIC "NNUV1\0\0"
+#define QPOL_FILE_MAGIC_SIZE 8
+
+static int read_exact(FILE* f, void* dst, size_t nbytes) {
+    return fread(dst, 1, nbytes, f) == nbytes;
+}
+
+static int load_qpolicy_file(const char* path, char* err, size_t err_sz) {
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        snprintf(err, err_sz, "Failed to open qpolicy file: %s", path);
+        return 0;
+    }
+
+    char magic[QPOL_FILE_MAGIC_SIZE];
+    int32_t dims[3];
+    int32_t search_depth = CHESS_QPOL_SEARCH_DEPTH_DEFAULT;
+    int32_t out_b = 0;
+
+    qpol_clear();
+    if (!read_exact(f, magic, sizeof(magic))) {
+        snprintf(err, err_sz, "qpolicy file too short (magic)");
+        fclose(f);
+        return 0;
+    }
+    if (memcmp(magic, QPOL_FILE_MAGIC, QPOL_FILE_MAGIC_SIZE) != 0) {
+        snprintf(err, err_sz, "Invalid qpolicy magic");
+        fclose(f);
+        return 0;
+    }
+    if (!read_exact(f, dims, sizeof(dims))) {
+        snprintf(err, err_sz, "qpolicy file too short (dims)");
+        fclose(f);
+        return 0;
+    }
+    if (dims[0] != CHESS_HALFKP_FEATURES || dims[1] != CHESS_NNUE_ACCUM || dims[2] != CHESS_NNUE_HIDDEN) {
+        snprintf(err, err_sz, "qpolicy dims mismatch: got (%d,%d,%d) expected (%d,%d,%d)",
+                 (int)dims[0], (int)dims[1], (int)dims[2],
+                 CHESS_HALFKP_FEATURES, CHESS_NNUE_ACCUM, CHESS_NNUE_HIDDEN);
+        fclose(f);
+        return 0;
+    }
+    if (!read_exact(f, &search_depth, sizeof(search_depth))) {
+        snprintf(err, err_sz, "qpolicy file too short (search_depth)");
+        fclose(f);
+        return 0;
+    }
+    if (search_depth < 1) search_depth = 1;
+    if (search_depth > 8) search_depth = 8;
+    g_qpol.search_depth = search_depth;
+
+    if (!read_exact(f, g_qpol.in_bias, sizeof(g_qpol.in_bias)) ||
+        !read_exact(f, g_qpol.in_w, sizeof(g_qpol.in_w)) ||
+        !read_exact(f, g_qpol.l1_w, sizeof(g_qpol.l1_w)) ||
+        !read_exact(f, g_qpol.l1_b, sizeof(g_qpol.l1_b)) ||
+        !read_exact(f, g_qpol.l2_w, sizeof(g_qpol.l2_w)) ||
+        !read_exact(f, g_qpol.l2_b, sizeof(g_qpol.l2_b)) ||
+        !read_exact(f, g_qpol.out_w, sizeof(g_qpol.out_w)) ||
+        !read_exact(f, &out_b, sizeof(out_b))) {
+        snprintf(err, err_sz, "qpolicy file too short (weights)");
+        fclose(f);
+        qpol_clear();
+        return 0;
+    }
+    g_qpol.out_b = out_b;
+
+    fclose(f);
+    g_qpol.loaded = 1;
+    return 1;
+}
+
 /* ================================================================
  * Helper: load FEN strings from a file (one per line)
  * Returns number of FENs loaded, or -1 on error.
@@ -159,6 +230,10 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         PyErr_SetString(PyExc_ValueError, "All arrays must be contiguous");
         return NULL;
     }
+    if (PyArray_TYPE(observations) != NPY_FLOAT32) {
+        PyErr_SetString(PyExc_TypeError, "observations array must be float32");
+        return NULL;
+    }
 
     /* Allocate VecEnv */
     VecEnv* vec = (VecEnv*)calloc(1, sizeof(VecEnv));
@@ -190,7 +265,7 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     }
 
     /* Get raw data pointers */
-    unsigned char* obs_data  = (unsigned char*)PyArray_DATA(observations);
+    float* obs_data          = (float*)PyArray_DATA(observations);
     int obs_stride_bytes     = (int)PyArray_STRIDE(observations, 0); /* bytes per agent obs row */
 
     /* actions must be int32 or int64 */
@@ -213,7 +288,7 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     for (int g = 0; g < num_games; g++) {
         ChessEnv* game = &vec->games[g];
 
-        game->observations = obs_data + g * obs_stride_bytes;
+        game->observations = (float*)((char*)obs_data + g * obs_stride_bytes);
         game->obs_stride   = 0;  /* unused in 1-agent mode */
 
         game->actions        = (char*)act_data + g * act_itemsize;
@@ -275,11 +350,16 @@ static void vec_reset_game(VecEnv* vec, int g) {
             game->phase_state[0].pick_phase = 0;
             game->phase_state[0].selected_square = -1;
             game->phase_state[0].valid_dest_count = 0;
+            game->phase_state[0].planned_valid = 0;
+            game->phase_state[0].planned_from_sq = -1;
+            game->phase_state[0].planned_to_sq = -1;
+            game->phase_state[0].planned_phase1_action = 0;
             game->rewards[0] = 0.0f;
             game->terminals[0] = 0;
             /* Re-record position hash for the FEN position */
             game->position_history_count = 0;
             record_position_hash(game);
+            rebuild_halfkp_accumulator(game);
             write_observations(game);
         }
     }
@@ -330,11 +410,16 @@ static PyObject* vec_step(PyObject* self, PyObject* args) {
                 game->phase_state[0].pick_phase = 0;
                 game->phase_state[0].selected_square = -1;
                 game->phase_state[0].valid_dest_count = 0;
+                game->phase_state[0].planned_valid = 0;
+                game->phase_state[0].planned_from_sq = -1;
+                game->phase_state[0].planned_to_sq = -1;
+                game->phase_state[0].planned_phase1_action = 0;
                 game->rewards[0] = 0.0f;
                 game->terminals[0] = 0;
                 /* Re-record position hash for the FEN position */
                 game->position_history_count = 0;
                 record_position_hash(game);
+                rebuild_halfkp_accumulator(game);
                 write_observations(game);
             }
         }
@@ -471,6 +556,129 @@ static PyObject* vec_set_fen_pct(PyObject* self, PyObject* args) {
 }
 
 /* ================================================================
+ * vec_load_qpolicy(handle, qpolicy_path)
+ * ================================================================ */
+static PyObject* vec_load_qpolicy(PyObject* self, PyObject* args) {
+    (void)self;
+    (void)PyLong_AsVoidPtr(PyTuple_GetItem(args, 0));  // keep API symmetric with vec_* handle methods
+    PyObject* path_obj = PyTuple_GetItem(args, 1);
+    if (!PyUnicode_Check(path_obj)) {
+        PyErr_SetString(PyExc_TypeError, "qpolicy_path must be a string");
+        return NULL;
+    }
+    const char* path = PyUnicode_AsUTF8(path_obj);
+    char err[256];
+    if (!load_qpolicy_file(path, err, sizeof(err))) {
+        PyErr_SetString(PyExc_IOError, err);
+        return NULL;
+    }
+    Py_RETURN_TRUE;
+}
+
+/* ================================================================
+ * vec_infer_actions(handle, out_actions[, out_values])
+ * ================================================================ */
+static PyObject* vec_infer_actions(PyObject* self, PyObject* args) {
+    (void)self;
+    int nargs = (int)PyTuple_Size(args);
+    if (nargs < 2 || nargs > 3) {
+        PyErr_SetString(PyExc_TypeError, "vec_infer_actions expects (handle, out_actions[, out_values])");
+        return NULL;
+    }
+    if (!qpol_is_loaded()) {
+        PyErr_SetString(PyExc_RuntimeError, "NNUE policy not loaded. Call vec_load_qpolicy first.");
+        return NULL;
+    }
+
+    VecEnv* vec = (VecEnv*)PyLong_AsVoidPtr(PyTuple_GetItem(args, 0));
+    PyArrayObject* out_actions = (PyArrayObject*)PyTuple_GetItem(args, 1);
+    if (!PyArray_ISCONTIGUOUS(out_actions) || PyArray_TYPE(out_actions) != NPY_INT32) {
+        PyErr_SetString(PyExc_TypeError, "out_actions must be contiguous int32 array");
+        return NULL;
+    }
+    if (PyArray_SIZE(out_actions) < vec->num_games) {
+        PyErr_SetString(PyExc_ValueError, "out_actions size is smaller than num_games");
+        return NULL;
+    }
+    int32_t* actions = (int32_t*)PyArray_DATA(out_actions);
+
+    float* values = NULL;
+    if (nargs == 3) {
+        PyArrayObject* out_values = (PyArrayObject*)PyTuple_GetItem(args, 2);
+        if (!PyArray_ISCONTIGUOUS(out_values) || PyArray_TYPE(out_values) != NPY_FLOAT32) {
+            PyErr_SetString(PyExc_TypeError, "out_values must be contiguous float32 array");
+            return NULL;
+        }
+        if (PyArray_SIZE(out_values) < vec->num_games) {
+            PyErr_SetString(PyExc_ValueError, "out_values size is smaller than num_games");
+            return NULL;
+        }
+        values = (float*)PyArray_DATA(out_values);
+    }
+
+    for (int g = 0; g < vec->num_games; g++) {
+        float v = 0.0f;
+        int action = qpol_select_action(&vec->games[g], &v);
+        actions[g] = (int32_t)action;
+        if (values) values[g] = v;
+    }
+    return PyLong_FromLong(vec->num_games);
+}
+
+/* ================================================================
+ * vec_step_qpolicy(handle)
+ *
+ * Fully C-side inference + stepping. No Python policy forward call.
+ * ================================================================ */
+static PyObject* vec_step_qpolicy(PyObject* self, PyObject* args) {
+    (void)self;
+    if (!qpol_is_loaded()) {
+        PyErr_SetString(PyExc_RuntimeError, "NNUE policy not loaded. Call vec_load_qpolicy first.");
+        return NULL;
+    }
+    VecEnv* vec = (VecEnv*)PyLong_AsVoidPtr(PyTuple_GetItem(args, 0));
+
+    Py_BEGIN_ALLOW_THREADS
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int g = 0; g < vec->num_games; g++) {
+        ChessEnv* game = &vec->games[g];
+        int was_terminal = game->terminals[0];
+        if (!was_terminal) {
+            int action = qpol_select_action(game, NULL);
+            set_action(game, 0, action);
+        }
+        c_step(game);
+
+        if (was_terminal && game->use_curriculum && vec->fen_count > 0 && vec->fen_curric_pct > 0.0f) {
+            float r = (float)(chess_xorshift64(&game->rng_state) & 0xFFFFFF) / (float)0x1000000;
+            if (r < vec->fen_curric_pct) {
+                int idx = chess_rand_int(&game->rng_state, vec->fen_count);
+                setup_from_fen(game, vec->fen_list[idx]);
+                game->learner_color = game->current_player;
+                game->step_count = 0;
+                game->phase_state[0].pick_phase = 0;
+                game->phase_state[0].selected_square = -1;
+                game->phase_state[0].valid_dest_count = 0;
+                game->phase_state[0].planned_valid = 0;
+                game->phase_state[0].planned_from_sq = -1;
+                game->phase_state[0].planned_to_sq = -1;
+                game->phase_state[0].planned_phase1_action = 0;
+                game->rewards[0] = 0.0f;
+                game->terminals[0] = 0;
+                game->position_history_count = 0;
+                record_position_hash(game);
+                rebuild_halfkp_accumulator(game);
+                write_observations(game);
+            }
+        }
+    }
+    Py_END_ALLOW_THREADS
+    Py_RETURN_NONE;
+}
+
+/* ================================================================
  * vec_close(handle)
  * ================================================================ */
 static PyObject* vec_close(PyObject* self, PyObject* args) {
@@ -496,6 +704,9 @@ static PyMethodDef methods[] = {
     {"vec_log",       vec_log,       METH_VARARGS, "Aggregate and return logs"},
     {"vec_load_fens", vec_load_fens, METH_VARARGS, "Load FEN file for curriculum"},
     {"vec_set_fen_pct", vec_set_fen_pct, METH_VARARGS, "Set FEN curriculum percentage"},
+    {"vec_load_qpolicy", vec_load_qpolicy, METH_VARARGS, "Load native NNUE policy binary"},
+    {"vec_infer_actions", vec_infer_actions, METH_VARARGS, "Infer actions (and optional values) using NNUE search"},
+    {"vec_step_qpolicy", vec_step_qpolicy, METH_VARARGS, "Infer and step fully in C using NNUE search"},
     {"vec_close",     vec_close,     METH_VARARGS, "Free all games"},
     {NULL, NULL, 0, NULL}
 };

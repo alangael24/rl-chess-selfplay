@@ -21,72 +21,36 @@ Two ways to train:
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import sys
 import argparse
 
 import pufferlib
 import pufferlib.pytorch
-import pufferlib.models
 
 from chess_env import Chess, OBS_SIZE, NUM_ACTIONS
 
-BOARD_SIZE = 64
-NUM_PIECE_TYPES = 13  # 0=empty, 1-6=white pieces, 7-12=black pieces
-
-# Observation layout offsets
-OBS_BOARD = 0        # 64 bytes
-OBS_SIDE = 64        # 2 bytes (one-hot: is_my_turn)
-OBS_CASTLING = 66    # 4 bytes
-OBS_EP = 70          # 1 byte
-OBS_PHASE = 71       # 2 bytes (one-hot: phase 0 or 1)
-OBS_SELECTED = 73    # 64 bytes (one-hot selected piece plane)
-OBS_VALID_PIECES = 137  # 64 bytes
-OBS_VALID_DESTS = 201   # 64 bytes
-OBS_VALID_PROMOS = 265  # 32 bytes
-OBS_SELF_CHECK = 297    # 1 byte
-OBS_OPP_CHECK = 298     # 1 byte
-OBS_RULE50 = 299        # 1 byte
-OBS_PASS_VALID = 300    # 1 byte
+ACCUM_SIZE = 256
+OBS_PHASE = ACCUM_SIZE
+OBS_LEARNER_TURN = ACCUM_SIZE + 2
 
 
 class Policy(nn.Module):
-    """Lightweight fighter-style policy for higher throughput."""
-    def __init__(self, env, hidden_size=256, cnn_channels=64, embed_dim=16, **kwargs):
+    """Feed-forward MLP policy over incremental accumulator observations."""
+    def __init__(self, env, hidden_size=256, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
         self.is_continuous = False
 
-        # 13 board one-hot + selected + valid_pieces + valid_dests = 16 channels.
-        spatial_in = NUM_PIECE_TYPES + 3
-        self.spatial_cnn = nn.Sequential(
-            pufferlib.pytorch.layer_init(
-                nn.Conv2d(spatial_in, cnn_channels, kernel_size=3, stride=2, padding=1)),
-            nn.ReLU(),
-            pufferlib.pytorch.layer_init(
-                nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, stride=2, padding=1)),
-            nn.ReLU(),
-            nn.Flatten(),
-        )
-        # 8x8 -> 4x4 -> 2x2 => cnn_channels * 4.
-        spatial_flat = cnn_channels * 4
-
-        self.side_embed = nn.Embedding(2, embed_dim)
-        self.castle_embed = nn.Embedding(16, embed_dim)
-        self.ep_embed = nn.Embedding(65, embed_dim)  # 0-7 files + 64 as "none"
-        self.phase_embed = nn.Embedding(2, embed_dim)
-
-        # scalar: self_check + opp_check + rule50 + pass_valid + valid_promos(32) = 36
-        self.scalar_encoder = nn.Sequential(
-            pufferlib.pytorch.layer_init(nn.Linear(36, hidden_size)),
+        in_features = ACCUM_SIZE + 3  # accumulator + phase one-hot + learner_turn
+        # NNUE-style feed-forward stack (no recurrence): 4 dense layers.
+        self.backbone = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(in_features, hidden_size)),
             nn.ReLU(),
             pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
             nn.ReLU(),
-        )
-
-        total_features = spatial_flat + 4 * embed_dim + hidden_size
-        self.fusion_fc = nn.Sequential(
-            pufferlib.pytorch.layer_init(nn.Linear(total_features, hidden_size)),
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.ReLU(),
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
             nn.ReLU(),
         )
 
@@ -95,88 +59,33 @@ class Policy(nn.Module):
         self.critic = pufferlib.pytorch.layer_init(
             nn.Linear(hidden_size, 1), std=1.0)
 
-        self._action_mask = None
+        self._phase0 = None
 
     def encode_observations(self, x, state=None):
-        batch_size = x.shape[0]
-
-        board = x[:, OBS_BOARD:OBS_BOARD + 64].long()
-        phase = x[:, OBS_PHASE:OBS_PHASE + 2].float() / 255.0
-        selected = x[:, OBS_SELECTED:OBS_SELECTED + 64].float() / 255.0
-        valid_pieces = x[:, OBS_VALID_PIECES:OBS_VALID_PIECES + 64].float() / 255.0
-        valid_dests = x[:, OBS_VALID_DESTS:OBS_VALID_DESTS + 64].float() / 255.0
-        valid_promos = x[:, OBS_VALID_PROMOS:OBS_VALID_PROMOS + 32].float() / 255.0
-        self_check = x[:, OBS_SELF_CHECK:OBS_SELF_CHECK + 1].float() / 255.0
-        opp_check = x[:, OBS_OPP_CHECK:OBS_OPP_CHECK + 1].float() / 255.0
-        rule50 = x[:, OBS_RULE50:OBS_RULE50 + 1].float() / 255.0
-        pass_valid = x[:, OBS_PASS_VALID:OBS_PASS_VALID + 1].float() / 255.0
-
-        board = torch.clamp(board, 0, NUM_PIECE_TYPES - 1)
-        board_oh = F.one_hot(board, num_classes=NUM_PIECE_TYPES).float()
-        board_oh = board_oh.view(batch_size, 8, 8, NUM_PIECE_TYPES).permute(0, 3, 1, 2)
-
-        # Spatial channels
-        vp_plane = valid_pieces.view(batch_size, 1, 8, 8)
-        vd_plane = valid_dests.view(batch_size, 1, 8, 8)
-        sp_plane = selected.view(batch_size, 1, 8, 8)
-
-        spatial = torch.cat([board_oh, sp_plane, vp_plane, vd_plane], dim=1)
-        spatial_feat = self.spatial_cnn(spatial)
-
-        side_idx = x[:, OBS_SIDE:OBS_SIDE + 2].argmax(dim=1).long()
-        castling_bits = (x[:, OBS_CASTLING:OBS_CASTLING + 4] > 0).long()
-        castling_idx = (
-            castling_bits[:, 0]
-            + 2 * castling_bits[:, 1]
-            + 4 * castling_bits[:, 2]
-            + 8 * castling_bits[:, 3]
-        ).long()
-        ep_raw = x[:, OBS_EP].long()
-        ep_idx = torch.where(
-            ep_raw == 255,
-            torch.full_like(ep_raw, 64),
-            torch.clamp(ep_raw, 0, 7),
-        )
-        phase_idx = x[:, OBS_PHASE:OBS_PHASE + 2].argmax(dim=1).long()
-
-        side_feat = self.side_embed(side_idx)
-        castle_feat = self.castle_embed(castling_idx)
-        ep_feat = self.ep_embed(ep_idx)
-        phase_feat = self.phase_embed(phase_idx)
-
-        scalar_in = torch.cat([self_check, opp_check, rule50, pass_valid, valid_promos], dim=1)
-        scalar_feat = self.scalar_encoder(scalar_in)
-
-        combined = torch.cat([spatial_feat, side_feat, castle_feat, ep_feat, phase_feat, scalar_feat], dim=1)
-        hidden = self.fusion_fc(combined)
-
-        is_phase0 = phase[:, 0:1] > 0.5
-        mask = torch.zeros(batch_size, NUM_ACTIONS, device=x.device, dtype=torch.bool)
-        vp_bool = valid_pieces > 0.5
-        vd_bool = valid_dests > 0.5
-        mask[:, :64] = torch.where(is_phase0, vp_bool, vd_bool)
-        promo_bool = valid_promos > 0.5
-        mask[:, 64:96] = torch.where(is_phase0, torch.zeros_like(promo_bool), promo_bool)
-        # PASS is legacy and should remain invalid in 1-agent topology.
-        mask[:, 96] = False
-        self._action_mask = mask
-
+        accum = x[:, :ACCUM_SIZE].float()
+        phase = x[:, OBS_PHASE:OBS_PHASE + 2].float()
+        learner_turn = x[:, OBS_LEARNER_TURN:OBS_LEARNER_TURN + 1].float()
+        model_in = torch.cat([accum, phase, learner_turn], dim=1)
+        hidden = self.backbone(model_in)
+        self._phase0 = phase[:, 0:1] > 0.5
         return hidden
 
     def decode_actions(self, hidden):
         logits = self.actor(hidden)
         value = self.critic(hidden)
 
-        if self._action_mask is not None:
-            mask = self._action_mask
-            if mask.shape[0] != logits.shape[0]:
-                mask = None
-            else:
-                masked_logits = logits.masked_fill(~mask, -1e9)
-                all_masked = ~mask.any(dim=1)
-                if all_masked.any():
-                    masked_logits[all_masked] = logits[all_masked]
-                logits = masked_logits
+        if self._phase0 is not None and self._phase0.shape[0] == logits.shape[0]:
+            # Keep PASS invalid (legacy action never valid in 1-agent mode).
+            logits = logits.clone()
+            logits[:, 96] = -1e9
+            # Promotions are impossible in phase 0.
+            promo_logits = logits[:, 64:96]
+            phase0 = self._phase0.expand_as(promo_logits)
+            logits[:, 64:96] = torch.where(
+                phase0,
+                torch.full_like(promo_logits, -1e9),
+                promo_logits,
+            )
 
         return logits, value
 
@@ -187,11 +96,6 @@ class Policy(nn.Module):
 
     def forward(self, x, state=None):
         return self.forward_eval(x, state)
-
-
-class ChessLSTM(pufferlib.models.LSTMWrapper):
-    def __init__(self, env, policy, input_size=256, hidden_size=256):
-        super().__init__(env, policy, input_size, hidden_size)
 
 
 def _clamp01(x):
@@ -298,7 +202,7 @@ if __name__ == "__main__":
     args['train']['clip_coef'] = 0.15
     args['train']['max_grad_norm'] = 1.0
     args['train']['anneal_lr'] = True
-    args['train']['use_rnn'] = True
+    args['train']['use_rnn'] = False
 
     NUM_GAMES = cli_args.num_games
     NUM_AGENTS = NUM_GAMES  # 1 agent per game
@@ -342,8 +246,7 @@ if __name__ == "__main__":
             print(f"  Curriculum schedule: {schedule}")
 
     device = args['train'].get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
-    base_policy = Policy(vecenv, hidden_size=256, num_blocks=2)
-    policy = ChessLSTM(vecenv, base_policy, input_size=256, hidden_size=256).to(device)
+    policy = Policy(vecenv, hidden_size=256).to(device)
 
     print(f"\n  Params: {sum(p.numel() for p in policy.parameters()):,}")
     print(f"  Device: {device}")

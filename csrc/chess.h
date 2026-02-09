@@ -24,6 +24,10 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 
 // ============================================================================
 // Constants
@@ -33,12 +37,24 @@
 #define CHESS_PASS_ACTION 96
 #define CHESS_MAX_MOVES 256
 
-// Observation layout (per player):
-//   64 board + 2 side + 4 castling + 1 ep + 2 phase + 64 selected_piece
-//   + 64 valid_pieces + 64 valid_dests + 32 valid_promos
-//   + 1 self_check + 1 opp_check + 1 rule50 + 1 pass_valid
-// Total = 301
-#define CHESS_OBS_SIZE 301
+// Incremental NNUE-like observation:
+//   [0:255]   current-player accumulator (float projection for PPO path)
+//   [256:257] phase one-hot (pick piece / pick destination)
+//   [258]     learner_turn flag
+#define CHESS_ACCUM_SIZE 256
+#define CHESS_OBS_META 3
+#define CHESS_OBS_SIZE (CHESS_ACCUM_SIZE + CHESS_OBS_META)
+
+// HalfKP-style sparse input space (64 king squares * 10 planes * 64 + 64 stm features).
+#define CHESS_HALFKP_MAIN_FEATURES 40960
+#define CHESS_HALFKP_FEATURES 41024
+
+// Native NNUE dimensions (CPU integer path).
+#define CHESS_NNUE_ACCUM 256
+#define CHESS_NNUE_INPUT (CHESS_NNUE_ACCUM * 2)
+#define CHESS_NNUE_HIDDEN 32
+#define CHESS_NNUE_FV_SCALE 16
+#define CHESS_QPOL_SEARCH_DEPTH_DEFAULT 1
 
 #define EMPTY 0
 #define WP 1
@@ -220,10 +236,14 @@ typedef struct {
     int selected_square;      // square picked in phase 0 (-1 if none)
     int valid_dest_moves[CHESS_MAX_MOVES]; // legal moves from selected_square (encoded as from*64+to)
     int valid_dest_count;
+    int planned_valid;
+    int planned_from_sq;
+    int planned_to_sq;
+    int planned_phase1_action;
 } PhaseState;
 
 typedef struct ChessEnv {
-    unsigned char* observations;
+    float* observations;
     void* actions;
     int action_itemsize;  /* 4 (int32) or 8 (int64) */
     float* rewards;
@@ -291,6 +311,13 @@ typedef struct ChessEnv {
     // 1-agent topology: learner_color alternates each reset
     int learner_color;                // 0=White, 1=Black — the "learner" perspective
 
+    // Native NNUE state:
+    //   nnue_accum[0] = white-perspective half (relative to white king)
+    //   nnue_accum[1] = black-perspective half (relative to black king)
+    int16_t nnue_accum[2][CHESS_NNUE_ACCUM];
+    int king_rel_sq[2];
+    unsigned char halfkp_active[2][CHESS_HALFKP_FEATURES];
+
     // Legal move cache
     int legal_moves_cache[256];       // cached legal moves array
     int legal_moves_cache_count;      // -1 = invalid
@@ -298,12 +325,146 @@ typedef struct ChessEnv {
     int legal_moves_side;             // current_player when cached
 } ChessEnv;
 
+typedef struct QuantPolicy {
+    int loaded;
+    int use_avx2;
+    int search_depth;
+    int16_t in_bias[CHESS_NNUE_ACCUM];
+    int16_t in_w[CHESS_HALFKP_FEATURES * CHESS_NNUE_ACCUM];
+    int8_t l1_w[CHESS_NNUE_HIDDEN * CHESS_NNUE_INPUT];
+    int32_t l1_b[CHESS_NNUE_HIDDEN];
+    int8_t l2_w[CHESS_NNUE_HIDDEN * CHESS_NNUE_HIDDEN];
+    int32_t l2_b[CHESS_NNUE_HIDDEN];
+    int8_t out_w[CHESS_NNUE_HIDDEN];
+    int32_t out_b;
+} QuantPolicy;
+
+static QuantPolicy g_qpol;
+
 /* Read action[idx] respecting the actual numpy dtype (int32 or int64). */
 static inline int get_action(const ChessEnv* env, int idx) {
     if (env->action_itemsize == 8)
         return (int)((int64_t*)env->actions)[idx];
     return ((int32_t*)env->actions)[idx];
 }
+
+/* Write action[idx] respecting the actual numpy dtype (int32 or int64). */
+static inline void set_action(ChessEnv* env, int idx, int action) {
+    if (env->action_itemsize == 8) {
+        ((int64_t*)env->actions)[idx] = (int64_t)action;
+    } else {
+        ((int32_t*)env->actions)[idx] = (int32_t)action;
+    }
+}
+
+// ============================================================================
+// Native NNUE integer inference helpers
+// ============================================================================
+
+static inline int8_t clamp_relu_i8(int v) {
+    if (v <= 0) return 0;
+    if (v > 127) return 127;
+    return (int8_t)v;
+}
+
+static inline int16_t clamp_i16(int32_t v) {
+    if (v > 32767) return 32767;
+    if (v < -32768) return -32768;
+    return (int16_t)v;
+}
+
+static inline int32_t dot_i8_i8_scalar(const int8_t* a, const int8_t* b, int n) {
+    int32_t s = 0;
+    for (int i = 0; i < n; i++) {
+        s += (int32_t)a[i] * (int32_t)b[i];
+    }
+    return s;
+}
+
+#ifdef __AVX2__
+static inline int32_t dot_i8_i8_avx2(const int8_t* a, const int8_t* b, int n) {
+    __m256i vacc = _mm256_setzero_si256();
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m128i va8 = _mm_loadu_si128((const __m128i*)(a + i));
+        __m128i vb8 = _mm_loadu_si128((const __m128i*)(b + i));
+        __m256i va16 = _mm256_cvtepi8_epi16(va8);
+        __m256i vb16 = _mm256_cvtepi8_epi16(vb8);
+        __m256i vmadd = _mm256_madd_epi16(va16, vb16);
+        vacc = _mm256_add_epi32(vacc, vmadd);
+    }
+    int32_t tmp[8];
+    _mm256_storeu_si256((__m256i*)tmp, vacc);
+    int32_t s = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+    for (; i < n; i++) {
+        s += (int32_t)a[i] * (int32_t)b[i];
+    }
+    return s;
+}
+#endif
+
+static inline int32_t dot_i8_i8(const int8_t* a, const int8_t* b, int n) {
+#ifdef __AVX2__
+    if (g_qpol.use_avx2) return dot_i8_i8_avx2(a, b, n);
+#endif
+    return dot_i8_i8_scalar(a, b, n);
+}
+
+static inline void qpol_clear(void) {
+    memset(&g_qpol, 0, sizeof(g_qpol));
+#ifdef __AVX2__
+    g_qpol.use_avx2 = 1;
+#else
+    g_qpol.use_avx2 = 0;
+#endif
+    g_qpol.search_depth = CHESS_QPOL_SEARCH_DEPTH_DEFAULT;
+}
+
+static inline int qpol_is_loaded(void) {
+    return g_qpol.loaded != 0;
+}
+
+static inline int8_t nnue_clip_input(int16_t v) {
+    if (v <= 0) return 0;
+    if (v > 127) return 127;
+    return (int8_t)v;
+}
+
+static inline int32_t qpol_value_raw(const ChessEnv* env) {
+    int stm = env->current_player;
+    int opp = 1 - stm;
+
+    int8_t x[CHESS_NNUE_INPUT];
+    int8_t h1[CHESS_NNUE_HIDDEN];
+    int8_t h2[CHESS_NNUE_HIDDEN];
+
+    for (int i = 0; i < CHESS_NNUE_ACCUM; i++) {
+        x[i] = nnue_clip_input(env->nnue_accum[stm][i]);
+        x[CHESS_NNUE_ACCUM + i] = nnue_clip_input(env->nnue_accum[opp][i]);
+    }
+
+    for (int o = 0; o < CHESS_NNUE_HIDDEN; o++) {
+        const int8_t* row = g_qpol.l1_w + o * CHESS_NNUE_INPUT;
+        int32_t acc = g_qpol.l1_b[o] + dot_i8_i8(x, row, CHESS_NNUE_INPUT);
+        h1[o] = clamp_relu_i8(acc);
+    }
+
+    for (int o = 0; o < CHESS_NNUE_HIDDEN; o++) {
+        const int8_t* row = g_qpol.l2_w + o * CHESS_NNUE_HIDDEN;
+        int32_t acc = g_qpol.l2_b[o] + dot_i8_i8(h1, row, CHESS_NNUE_HIDDEN);
+        h2[o] = clamp_relu_i8(acc);
+    }
+
+    return g_qpol.out_b + dot_i8_i8(h2, g_qpol.out_w, CHESS_NNUE_HIDDEN);
+}
+
+static inline float qpol_value_eval(const ChessEnv* env) {
+    if (!qpol_is_loaded()) return 0.0f;
+    return (float)qpol_value_raw(env) / (float)CHESS_NNUE_FV_SCALE;
+}
+
+// Implemented after move-generation helpers, because it runs alpha-beta search.
+static int qpol_select_action(ChessEnv* env, float* value_out);
 
 // ============================================================================
 // Pre-computed move tables (kept for SEE which still uses board[64] loops)
@@ -384,6 +545,159 @@ static inline int make_sq(int row, int col) {
 
 static inline int on_board(int row, int col) {
     return row >= 0 && row < 8 && col >= 0 && col < 8;
+}
+
+// ============================================================================
+// Incremental HalfKP-like accumulator helpers
+// ============================================================================
+
+static inline int flip_sq_vertical(int sq) {
+    int r = sq_row(sq);
+    int c = sq_col(sq);
+    return make_sq(7 - r, c);
+}
+
+static inline int piece_type_5way(int8_t piece) {
+    if (piece == EMPTY) return -1;
+    int pt = (piece >= BP) ? (piece - BP) : (piece - WP);
+    if (pt < 0 || pt > 5) return -1;
+    // Drop kings from HalfKP planes.
+    if (pt == 5) return -1;
+    return pt;
+}
+
+static inline int piece_plane_from_perspective(int perspective, int8_t piece) {
+    if (piece == EMPTY) return -1;
+    int pt = piece_type_5way(piece);
+    if (pt < 0) return -1;
+    int color = piece_color(piece);
+    if (color < 0) return -1;
+    int own = (color == perspective) ? 1 : 0;
+    return own ? pt : (5 + pt);
+}
+
+static inline int rel_sq_for_perspective(int perspective, int abs_sq) {
+    return (perspective == 0) ? abs_sq : flip_sq_vertical(abs_sq);
+}
+
+static inline int halfkp_feature_index(int perspective, int king_rel_sq, int8_t piece, int abs_sq) {
+    int plane = piece_plane_from_perspective(perspective, piece);
+    if (plane < 0) return -1;
+    int rel_sq = rel_sq_for_perspective(perspective, abs_sq);
+    return king_rel_sq * 640 + plane * 64 + rel_sq;
+}
+
+static inline int16_t halfkp_fallback_weight(int feature_idx, int dim) {
+    // Deterministic tiny fallback used when NNUE weights are not loaded yet.
+    uint32_t x = (uint32_t)feature_idx * 0x9E3779B1u;
+    x ^= (uint32_t)dim * 0x85EBCA77u;
+    x ^= x >> 16;
+    x *= 0x7FEB352Du;
+    x ^= x >> 15;
+    x *= 0x846CA68Bu;
+    x ^= x >> 16;
+    return (int16_t)((int)(x & 7u) - 3);
+}
+
+static inline void halfkp_accum_add(ChessEnv* env, int perspective, int feature_idx, int sign) {
+    if (feature_idx < 0 || feature_idx >= CHESS_HALFKP_FEATURES) return;
+    int base = feature_idx * CHESS_NNUE_ACCUM;
+    for (int d = 0; d < CHESS_NNUE_ACCUM; d++) {
+        int16_t w = qpol_is_loaded() ? g_qpol.in_w[base + d] : halfkp_fallback_weight(feature_idx, d);
+        int32_t delta = (sign > 0) ? (int32_t)w : -(int32_t)w;
+        env->nnue_accum[perspective][d] = clamp_i16((int32_t)env->nnue_accum[perspective][d] + delta);
+    }
+}
+
+static inline void halfkp_activate(ChessEnv* env, int perspective, int feature_idx) {
+    if (feature_idx < 0 || feature_idx >= CHESS_HALFKP_FEATURES) return;
+    if (env->halfkp_active[perspective][feature_idx]) return;
+    env->halfkp_active[perspective][feature_idx] = 1;
+    halfkp_accum_add(env, perspective, feature_idx, +1);
+}
+
+static inline void halfkp_deactivate(ChessEnv* env, int perspective, int feature_idx) {
+    if (feature_idx < 0 || feature_idx >= CHESS_HALFKP_FEATURES) return;
+    if (!env->halfkp_active[perspective][feature_idx]) return;
+    env->halfkp_active[perspective][feature_idx] = 0;
+    halfkp_accum_add(env, perspective, feature_idx, -1);
+}
+
+static inline int find_king_by_scan(const ChessEnv* env, int player) {
+    int8_t king = (player == 0) ? WK : BK;
+    for (int sq = 0; sq < 64; sq++) {
+        if (env->board[sq] == king) return sq;
+    }
+    return -1;
+}
+
+static void rebuild_halfkp_accumulator(ChessEnv* env) {
+    memset(env->halfkp_active, 0, sizeof(env->halfkp_active));
+    for (int perspective = 0; perspective < 2; perspective++) {
+        if (qpol_is_loaded()) {
+            memcpy(env->nnue_accum[perspective], g_qpol.in_bias, sizeof(g_qpol.in_bias));
+        } else {
+            memset(env->nnue_accum[perspective], 0, sizeof(env->nnue_accum[perspective]));
+        }
+    }
+
+    for (int perspective = 0; perspective < 2; perspective++) {
+        int king_abs_sq = find_king_by_scan(env, perspective);
+        if (king_abs_sq < 0) {
+            env->king_rel_sq[perspective] = -1;
+            continue;
+        }
+        env->king_rel_sq[perspective] = rel_sq_for_perspective(perspective, king_abs_sq);
+    }
+
+    for (int sq = 0; sq < 64; sq++) {
+        int8_t piece = env->board[sq];
+        if (piece == EMPTY) continue;
+        for (int perspective = 0; perspective < 2; perspective++) {
+            int king_rel = env->king_rel_sq[perspective];
+            if (king_rel < 0) continue;
+            int idx = halfkp_feature_index(perspective, king_rel, piece, sq);
+            if (idx >= 0) halfkp_activate(env, perspective, idx);
+        }
+    }
+
+    for (int perspective = 0; perspective < 2; perspective++) {
+        int king_rel = env->king_rel_sq[perspective];
+        if (king_rel < 0) continue;
+        int stm_idx = CHESS_HALFKP_MAIN_FEATURES + king_rel;
+        if (env->current_player == perspective) {
+            halfkp_activate(env, perspective, stm_idx);
+        }
+    }
+}
+
+static inline void halfkp_update_turn_feature(ChessEnv* env, int old_player, int new_player) {
+    if (old_player == new_player) return;
+    for (int perspective = 0; perspective < 2; perspective++) {
+        int king_rel = env->king_rel_sq[perspective];
+        if (king_rel < 0) continue;
+        int idx = CHESS_HALFKP_MAIN_FEATURES + king_rel;
+        if (old_player == perspective) halfkp_deactivate(env, perspective, idx);
+        if (new_player == perspective) halfkp_activate(env, perspective, idx);
+    }
+}
+
+static inline void halfkp_remove_piece_delta(ChessEnv* env, int8_t piece, int abs_sq) {
+    for (int perspective = 0; perspective < 2; perspective++) {
+        int king_rel = env->king_rel_sq[perspective];
+        if (king_rel < 0) continue;
+        int idx = halfkp_feature_index(perspective, king_rel, piece, abs_sq);
+        if (idx >= 0) halfkp_deactivate(env, perspective, idx);
+    }
+}
+
+static inline void halfkp_add_piece_delta(ChessEnv* env, int8_t piece, int abs_sq) {
+    for (int perspective = 0; perspective < 2; perspective++) {
+        int king_rel = env->king_rel_sq[perspective];
+        if (king_rel < 0) continue;
+        int idx = halfkp_feature_index(perspective, king_rel, piece, abs_sq);
+        if (idx >= 0) halfkp_activate(env, perspective, idx);
+    }
 }
 
 // ============================================================================
@@ -1502,6 +1816,15 @@ static void apply_move_ex(ChessEnv* env, int from_sq, int to_sq, int8_t promo_pi
     if (ptype >= BP) ptype -= 6;
 
     int is_capture = (captured != EMPTY);
+    int8_t placed_piece = piece;
+
+    int need_rebuild_accum = 0;
+    if (env->king_rel_sq[0] < 0 || env->king_rel_sq[1] < 0 || piece == WK || piece == BK) {
+        need_rebuild_accum = 1;
+    }
+    if (!need_rebuild_accum) {
+        halfkp_remove_piece_delta(env, piece, from_sq);
+    }
 
     // Zobrist: XOR out old castling/EP state
     env->zobrist_key ^= zob.castling[env->castling_rights];
@@ -1513,6 +1836,9 @@ static void apply_move_ex(ChessEnv* env, int from_sq, int to_sq, int8_t promo_pi
         int dir = (player == 0) ? -1 : 1;
         int ep_cap_sq = to_sq + dir * 8;
         int8_t ep_captured = env->board[ep_cap_sq];
+        if (!need_rebuild_accum) {
+            halfkp_remove_piece_delta(env, ep_captured, ep_cap_sq);
+        }
         env->board[ep_cap_sq] = EMPTY;
         bb_remove_piece(env, ep_cap_sq, ep_captured);
         is_capture = 1;
@@ -1520,6 +1846,9 @@ static void apply_move_ex(ChessEnv* env, int from_sq, int to_sq, int8_t promo_pi
 
     // Capture on destination
     if (captured != EMPTY) {
+        if (!need_rebuild_accum) {
+            halfkp_remove_piece_delta(env, captured, to_sq);
+        }
         bb_remove_piece(env, to_sq, captured);
     }
 
@@ -1544,28 +1873,49 @@ static void apply_move_ex(ChessEnv* env, int from_sq, int to_sq, int8_t promo_pi
             bb_remove_piece(env, to_sq, piece);
             bb_add_piece(env, to_sq, promo);
             env->board[to_sq] = promo;
+            placed_piece = promo;
         }
     }
 
     // Handle castling rook movement
     if (ptype == WK) {
         if (from_sq == 4 && to_sq == 6) {       // White kingside
+            if (!need_rebuild_accum) {
+                halfkp_remove_piece_delta(env, WR, 7);
+                halfkp_add_piece_delta(env, WR, 5);
+            }
             bb_move_piece(env, 7, 5, WR);
             env->board[5] = WR;
             env->board[7] = EMPTY;
         } else if (from_sq == 4 && to_sq == 2) { // White queenside
+            if (!need_rebuild_accum) {
+                halfkp_remove_piece_delta(env, WR, 0);
+                halfkp_add_piece_delta(env, WR, 3);
+            }
             bb_move_piece(env, 0, 3, WR);
             env->board[3] = WR;
             env->board[0] = EMPTY;
         } else if (from_sq == 60 && to_sq == 62) { // Black kingside
+            if (!need_rebuild_accum) {
+                halfkp_remove_piece_delta(env, BR, 63);
+                halfkp_add_piece_delta(env, BR, 61);
+            }
             bb_move_piece(env, 63, 61, BR);
             env->board[61] = BR;
             env->board[63] = EMPTY;
         } else if (from_sq == 60 && to_sq == 58) { // Black queenside
+            if (!need_rebuild_accum) {
+                halfkp_remove_piece_delta(env, BR, 56);
+                halfkp_add_piece_delta(env, BR, 59);
+            }
             bb_move_piece(env, 56, 59, BR);
             env->board[59] = BR;
             env->board[56] = EMPTY;
         }
+    }
+
+    if (!need_rebuild_accum) {
+        halfkp_add_piece_delta(env, placed_piece, to_sq);
     }
 
     // Update castling rights
@@ -1605,6 +1955,10 @@ static void apply_move_ex(ChessEnv* env, int from_sq, int to_sq, int8_t promo_pi
     // Update fullmove number after Black's move
     if (player == 1) {
         env->fullmove_number++;
+    }
+
+    if (need_rebuild_accum) {
+        rebuild_halfkp_accumulator(env);
     }
 }
 
@@ -1683,6 +2037,129 @@ static inline int flip_sq(int sq) {
     return make_sq(7 - r, c);
 }
 
+static inline int qpol_action_from_abs_sq(int player, int abs_sq) {
+    return (player == 0) ? abs_sq : flip_sq(abs_sq);
+}
+
+static int32_t qpol_alpha_beta(ChessEnv* env, int depth, int ply, int32_t alpha, int32_t beta) {
+    const int32_t kMate = 30000;
+    if (depth <= 0) {
+        return qpol_value_raw(env) / CHESS_NNUE_FV_SCALE;
+    }
+
+    int moves[CHESS_MAX_MOVES];
+    int count = generate_legal_moves_cached(env, moves, CHESS_MAX_MOVES);
+    if (count == 0) {
+        if (is_in_check(env, env->current_player)) {
+            return -kMate + ply;
+        }
+        return 0;
+    }
+
+    int side = env->current_player;
+    int32_t best = -kMate;
+    for (int i = 0; i < count; i++) {
+        ChessEnv snapshot = *env;
+        int from_sq = moves[i] / 64;
+        int to_sq = moves[i] % 64;
+
+        apply_move_ex(env, from_sq, to_sq, EMPTY);
+        env->current_player = 1 - side;
+        halfkp_update_turn_feature(env, side, env->current_player);
+
+        int32_t score = -qpol_alpha_beta(env, depth - 1, ply + 1, -beta, -alpha);
+        *env = snapshot;
+
+        if (score > best) best = score;
+        if (score > alpha) alpha = score;
+        if (alpha >= beta) break;
+    }
+
+    return best;
+}
+
+static int qpol_search_best_move(ChessEnv* env, int* best_from_sq, int* best_to_sq, int32_t* best_score) {
+    const int32_t kInf = 32000;
+    int moves[CHESS_MAX_MOVES];
+    int count = generate_legal_moves_cached(env, moves, CHESS_MAX_MOVES);
+    if (count <= 0) return 0;
+
+    int depth = g_qpol.search_depth;
+    if (depth <= 0) depth = 1;
+
+    int side = env->current_player;
+    int32_t alpha = -kInf;
+    int32_t beta = kInf;
+    int32_t best = -kInf;
+    int best_move = moves[0];
+
+    for (int i = 0; i < count; i++) {
+        ChessEnv snapshot = *env;
+        int from_sq = moves[i] / 64;
+        int to_sq = moves[i] % 64;
+
+        apply_move_ex(env, from_sq, to_sq, EMPTY);
+        env->current_player = 1 - side;
+        halfkp_update_turn_feature(env, side, env->current_player);
+
+        int32_t score = -qpol_alpha_beta(env, depth - 1, 1, -beta, -alpha);
+        *env = snapshot;
+
+        if (score > best) {
+            best = score;
+            best_move = moves[i];
+        }
+        if (score > alpha) alpha = score;
+    }
+
+    if (best_from_sq) *best_from_sq = best_move / 64;
+    if (best_to_sq) *best_to_sq = best_move % 64;
+    if (best_score) *best_score = best;
+    return 1;
+}
+
+static int qpol_select_action(ChessEnv* env, float* value_out) {
+    PhaseState* ps = &env->phase_state[0];
+    int player = env->current_player;
+
+    if (value_out) {
+        *value_out = qpol_is_loaded() ? qpol_value_eval(env) : 0.0f;
+    }
+
+    if (ps->pick_phase == 1) {
+        if (ps->planned_valid && ps->selected_square == ps->planned_from_sq) {
+            int planned = ps->planned_from_sq * 64 + ps->planned_to_sq;
+            for (int i = 0; i < ps->valid_dest_count; i++) {
+                if (ps->valid_dest_moves[i] == planned) {
+                    return ps->planned_phase1_action;
+                }
+            }
+        }
+        if (ps->valid_dest_count > 0) {
+            int to_sq = ps->valid_dest_moves[0] % 64;
+            return qpol_action_from_abs_sq(player, to_sq);
+        }
+        ps->planned_valid = 0;
+        return 0;
+    }
+
+    int best_from_sq = -1;
+    int best_to_sq = -1;
+    int32_t best_score = 0;
+    if (!qpol_search_best_move(env, &best_from_sq, &best_to_sq, &best_score)) {
+        ps->planned_valid = 0;
+        return 0;
+    }
+
+    ps->planned_valid = 1;
+    ps->planned_from_sq = best_from_sq;
+    ps->planned_to_sq = best_to_sq;
+    ps->planned_phase1_action = qpol_action_from_abs_sq(player, best_to_sq);
+
+    if (value_out) *value_out = (float)best_score;
+    return qpol_action_from_abs_sq(player, best_from_sq);
+}
+
 // Process a player's action in the two-phase system.
 // 1-agent topology: all rewards go to env->rewards[0] with sign based on learner_color.
 static int process_player_action(ChessEnv* env, int action, int player) {
@@ -1691,6 +2168,7 @@ static int process_player_action(ChessEnv* env, int action, int player) {
 
     // PASS action — in 1-agent mode, it's always the mover's turn, so PASS is invalid
     if (action == CHESS_PASS_ACTION) {
+        ps->planned_valid = 0;
         env->rewards[0] += sign * env->reward_invalid_move;
         env->episode_illegal_moves += 1.0f;
         return 0;
@@ -1699,6 +2177,7 @@ static int process_player_action(ChessEnv* env, int action, int player) {
     if (ps->pick_phase == 0) {
         // Phase 0: Pick a piece
         if (action < 0 || action > 63) {
+            ps->planned_valid = 0;
             env->rewards[0] += sign * env->reward_invalid_piece;
             env->episode_illegal_moves += 1.0f;
             return 0;
@@ -1708,6 +2187,7 @@ static int process_player_action(ChessEnv* env, int action, int player) {
         int abs_sq = (player == 0) ? action : flip_sq(action);
 
         if (!is_own_piece(env->board[abs_sq], player)) {
+            ps->planned_valid = 0;
             env->rewards[0] += sign * env->reward_invalid_piece;
             env->episode_illegal_moves += 1.0f;
             return 0;
@@ -1725,6 +2205,7 @@ static int process_player_action(ChessEnv* env, int action, int player) {
         }
 
         if (ps->valid_dest_count == 0) {
+            ps->planned_valid = 0;
             env->rewards[0] += sign * env->reward_invalid_piece;
             env->episode_illegal_moves += 1.0f;
             return 0;
@@ -1732,6 +2213,9 @@ static int process_player_action(ChessEnv* env, int action, int player) {
 
         ps->selected_square = abs_sq;
         ps->pick_phase = 1;
+        if (!ps->planned_valid || ps->planned_from_sq != abs_sq) {
+            ps->planned_valid = 0;
+        }
         env->rewards[0] += sign * env->reward_valid_piece;
         return 0;
 
@@ -1757,6 +2241,7 @@ static int process_player_action(ChessEnv* env, int action, int player) {
         } else {
             ps->pick_phase = 0;
             ps->selected_square = -1;
+            ps->planned_valid = 0;
             env->rewards[0] += sign * env->reward_invalid_move;
             env->episode_illegal_moves += 1.0f;
             return 0;
@@ -1774,6 +2259,7 @@ static int process_player_action(ChessEnv* env, int action, int player) {
         if (!found) {
             ps->pick_phase = 0;
             ps->selected_square = -1;
+            ps->planned_valid = 0;
             env->rewards[0] += sign * env->reward_invalid_move;
             env->episode_illegal_moves += 1.0f;
             return 0;
@@ -1817,6 +2303,7 @@ static int process_player_action(ChessEnv* env, int action, int player) {
 
         ps->pick_phase = 0;
         ps->selected_square = -1;
+        ps->planned_valid = 0;
         env->rewards[0] += sign * env->reward_valid_move;
 
         if (cap_piece != EMPTY && env->reward_capture_bonus != 0.0f) {
@@ -1870,143 +2357,18 @@ static int process_player_action(ChessEnv* env, int action, int player) {
 // Observation writing
 // ============================================================================
 
-// 1-agent topology: valid pieces mask for current mover
-static void compute_valid_pieces_mask(ChessEnv* env, unsigned char* mask) {
-    memset(mask, 0, 64);
-
-    int player = env->current_player;
-    int all_legal[CHESS_MAX_MOVES];
-    int num_legal = generate_legal_moves_cached(env, all_legal, CHESS_MAX_MOVES);
-
-    unsigned char has_legal_from[64];
-    memset(has_legal_from, 0, 64);
-    for (int i = 0; i < num_legal; i++) {
-        int from = all_legal[i] / 64;
-        has_legal_from[from] = 1;
-    }
-
-    for (int sq = 0; sq < 64; sq++) {
-        if (has_legal_from[sq]) {
-            int psq = (player == 0) ? sq : flip_sq(sq);
-            mask[psq] = 255;
-        }
-    }
-}
-
-// 1-agent topology: valid dests for current mover
-static void compute_valid_dests_mask(ChessEnv* env, unsigned char* dest_mask, unsigned char* promo_mask) {
-    memset(dest_mask, 0, 64);
-    memset(promo_mask, 0, 32);
-
-    int player = env->current_player;
-    PhaseState* ps = &env->phase_state[0]; // single phase state slot
-    if (ps->pick_phase != 1) return;
-
-    int from_sq = ps->selected_square;
-
-    for (int i = 0; i < ps->valid_dest_count; i++) {
-        int to = ps->valid_dest_moves[i] % 64;
-        int psq = (player == 0) ? to : flip_sq(to);
-
-        if (is_promotion_move(env, from_sq, to)) {
-            int file = sq_col(to);
-            for (int pt = 0; pt < 4; pt++) {
-                promo_mask[pt * 8 + file] = 255;
-            }
-            dest_mask[psq] = 255;
-        } else {
-            dest_mask[psq] = 255;
-        }
-    }
-}
-
-// 1-agent topology: write single observation from current mover's perspective.
+// 1-agent topology: write incremental accumulator + small control metadata.
 static void write_observations(ChessEnv* env) {
-    unsigned char* obs = env->observations; // single obs buffer
-    int viewer = env->current_player;
-
-    // === Board (offset 0, size 64) ===
-    if (viewer == 0) {
-        // White: normal orientation
-        for (int sq = 0; sq < 64; sq++) {
-            obs[sq] = (unsigned char)env->board[sq];
-        }
-    } else {
-        // Black: flip rows + swap colors
-        for (int sq = 0; sq < 64; sq++) {
-            int flipped_sq = flip_sq(sq);
-            int8_t p = env->board[flipped_sq];
-            unsigned char obs_val;
-            if (p == EMPTY) {
-                obs_val = 0;
-            } else if (is_white_piece(p)) {
-                obs_val = (unsigned char)(p + 6); // White pieces appear as Black
-            } else {
-                obs_val = (unsigned char)(p - 6); // Black pieces appear as White
-            }
-            obs[sq] = obs_val;
-        }
+    float* obs = env->observations;
+    int perspective = env->current_player;
+    for (int i = 0; i < CHESS_ACCUM_SIZE; i++) {
+        obs[i] = (float)env->nnue_accum[perspective][i] / 128.0f;
     }
 
-    // === Side one-hot relative to learner (offset 64, size 2) ===
-    // [1, 0] => learner to move, [0, 1] => opponent to move.
-    // This avoids hidden role aliasing in 1-agent self-play.
-    int learner_turn = (env->current_player == env->learner_color);
-    obs[64] = learner_turn ? 255 : 0;
-    obs[65] = learner_turn ? 0 : 255;
-
-    // === Castling rights (offset 66, size 4) — from viewer's perspective ===
-    if (viewer == 0) {
-        obs[66] = (env->castling_rights & CASTLE_WK) ? 255 : 0;
-        obs[67] = (env->castling_rights & CASTLE_WQ) ? 255 : 0;
-        obs[68] = (env->castling_rights & CASTLE_BK) ? 255 : 0;
-        obs[69] = (env->castling_rights & CASTLE_BQ) ? 255 : 0;
-    } else {
-        obs[66] = (env->castling_rights & CASTLE_BK) ? 255 : 0;
-        obs[67] = (env->castling_rights & CASTLE_BQ) ? 255 : 0;
-        obs[68] = (env->castling_rights & CASTLE_WK) ? 255 : 0;
-        obs[69] = (env->castling_rights & CASTLE_WQ) ? 255 : 0;
-    }
-
-    // === En passant file (offset 70, size 1) ===
-    if (env->en_passant_square >= 0) {
-        obs[70] = (unsigned char)sq_col(env->en_passant_square);
-    } else {
-        obs[70] = 255;
-    }
-
-    // === Phase one-hot (offset 71, size 2) ===
-    PhaseState* ps = &env->phase_state[0]; // single phase state slot
-    obs[71] = (ps->pick_phase == 0) ? 255 : 0;
-    obs[72] = (ps->pick_phase == 1) ? 255 : 0;
-
-    // === Selected piece plane (offset 73, size 64) ===
-    memset(obs + 73, 0, 64);
-    if (ps->pick_phase == 1 && ps->selected_square >= 0) {
-        int psq = (viewer == 0) ? ps->selected_square : flip_sq(ps->selected_square);
-        obs[73 + psq] = 255;
-    }
-
-    // === Valid pieces mask (offset 137, size 64) ===
-    compute_valid_pieces_mask(env, obs + 137);
-
-    // === Valid destinations mask (offset 201, size 64) + Valid promotions (offset 265, size 32) ===
-    compute_valid_dests_mask(env, obs + 201, obs + 265);
-
-    // === Self in check (offset 297, size 1) ===
-    obs[297] = is_in_check(env, viewer) ? 255 : 0;
-
-    // === Opponent in check (offset 298, size 1) ===
-    obs[298] = is_in_check(env, 1 - viewer) ? 255 : 0;
-
-    // === Rule50 counter (offset 299, size 1) ===
-    int rule50_scaled = (env->halfmove_clock * 255) / 100;
-    if (rule50_scaled > 255) rule50_scaled = 255;
-    obs[299] = (unsigned char)rule50_scaled;
-
-    // === Learner-turn flag (offset 300, size 1) ===
-    // Reuses legacy pass-valid byte as an explicit learner-role bit.
-    obs[300] = learner_turn ? 255 : 0;
+    PhaseState* ps = &env->phase_state[0];
+    obs[CHESS_ACCUM_SIZE + 0] = (ps->pick_phase == 0) ? 1.0f : 0.0f;
+    obs[CHESS_ACCUM_SIZE + 1] = (ps->pick_phase == 1) ? 1.0f : 0.0f;
+    obs[CHESS_ACCUM_SIZE + 2] = (env->current_player == env->learner_color) ? 1.0f : 0.0f;
 }
 
 // ============================================================================
@@ -2166,6 +2528,12 @@ static int setup_from_fen(ChessEnv* env, const char* fen) {
 // ============================================================================
 
 void init(ChessEnv* env) {
+    static int qpol_initialized = 0;
+    if (!qpol_initialized) {
+        qpol_clear();
+        qpol_initialized = 1;
+    }
+
     env->max_steps = 256;
     env->illegal_move_penalty = -0.1f;
     env->obs_stride = CHESS_OBS_SIZE;
@@ -2184,6 +2552,10 @@ void init(ChessEnv* env) {
     env->enable_50_move_rule = 1;
     env->enable_threefold_repetition = 1;
     env->use_curriculum = 0;
+    env->king_rel_sq[0] = -1;
+    env->king_rel_sq[1] = -1;
+    memset(env->nnue_accum, 0, sizeof(env->nnue_accum));
+    memset(env->halfkp_active, 0, sizeof(env->halfkp_active));
 }
 
 void c_reset(ChessEnv* env) {
@@ -2205,6 +2577,10 @@ void c_reset(ChessEnv* env) {
     env->phase_state[0].pick_phase = 0;
     env->phase_state[0].selected_square = -1;
     env->phase_state[0].valid_dest_count = 0;
+    env->phase_state[0].planned_valid = 0;
+    env->phase_state[0].planned_from_sq = -1;
+    env->phase_state[0].planned_to_sq = -1;
+    env->phase_state[0].planned_phase1_action = 0;
 
     // Clear single reward and terminal slot
     env->rewards[0] = 0.0f;
@@ -2223,6 +2599,7 @@ void c_reset(ChessEnv* env) {
     env->position_history_count = 0;
     record_position_hash(env);
 
+    rebuild_halfkp_accumulator(env);
     write_observations(env);
 }
 
@@ -2260,7 +2637,9 @@ void c_step(ChessEnv* env) {
 
     if (move_made) {
         env->episode_chess_moves++;
+        int old_player = env->current_player;
         env->current_player = 1 - env->current_player;
+        halfkp_update_turn_feature(env, old_player, env->current_player);
         record_position_hash(env);
 
         // Repetition penalty

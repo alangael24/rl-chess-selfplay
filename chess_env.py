@@ -6,6 +6,11 @@
   - learner_color alternates each reset for symmetric self-play
   - Rewards are signed: positive when learner benefits, negative when opponent does
 
+Observation:
+  - Incremental HalfKP-like accumulator (256 float dims)
+  - Phase one-hot (2 dims)
+  - Learner-turn bit (1 dim)
+
 Two-phase action system (97 actions):
   Phase 0: Pick a piece (action 0-63 = board square)
   Phase 1: Pick destination (0-63) or promotion (64-95)
@@ -20,9 +25,9 @@ import gymnasium
 import pufferlib
 from csrc import binding
 
-OBS_SIZE = 301    # 64 board + 2 side + 4 castling + 1 ep + 2 phase + 64 selected
-                  # + 64 valid_pieces + 64 valid_dests + 32 valid_promos
-                  # + 1 self_check + 1 opp_check + 1 rule50 + 1 pass_valid
+ACCUM_SIZE = 256
+OBS_META = 3
+OBS_SIZE = ACCUM_SIZE + OBS_META
 NUM_ACTIONS = 97  # 64 squares + 32 promotions + 1 pass
 
 
@@ -41,7 +46,7 @@ class Chess(pufferlib.PufferEnv):
                  buf=None, seed=0):
 
         self.single_observation_space = gymnasium.spaces.Box(
-            low=0, high=255, shape=(OBS_SIZE,), dtype=np.uint8)
+            low=-np.inf, high=np.inf, shape=(OBS_SIZE,), dtype=np.float32)
         self.single_action_space = gymnasium.spaces.Discrete(NUM_ACTIONS)
         self.report_interval = report_interval
         self.render_mode = render_mode
@@ -122,6 +127,34 @@ class Chess(pufferlib.PufferEnv):
         pct = float(max(0.0, min(1.0, pct)))
         binding.vec_set_fen_pct(self.c_envs, pct)
         self.fen_curric_pct = pct
+
+    def load_qpolicy(self, qpolicy_path):
+        """Load native NNUE int8/int16 weights for C-side search + inference."""
+        return bool(binding.vec_load_qpolicy(self.c_envs, qpolicy_path))
+
+    def infer_actions_qpolicy(self, out_values=False):
+        """Infer actions using C-side NNUE value search."""
+        actions = np.zeros(self.num_agents, dtype=np.int32)
+        if out_values:
+            values = np.zeros(self.num_agents, dtype=np.float32)
+            binding.vec_infer_actions(self.c_envs, actions, values)
+            return actions, values
+        binding.vec_infer_actions(self.c_envs, actions)
+        return actions
+
+    def step_qpolicy(self):
+        """Run NNUE search + step fully in C (no Python model forward)."""
+        binding.vec_step_qpolicy(self.c_envs)
+        self.tick += 1
+
+        info = []
+        if self.tick % self.report_interval == 0:
+            log = binding.vec_log(self.c_envs)
+            if log.get('episode_length', 0) > 0:
+                info.append(log)
+
+        return (self.observations, self.rewards,
+                self.terminals, self.truncations, info)
 
 
 def test_performance(timeout=10, num_envs=512):

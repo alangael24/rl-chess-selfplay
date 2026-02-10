@@ -342,6 +342,8 @@ typedef struct QuantPolicy {
 static QuantPolicy g_qpol;
 
 #define CHESS_SEARCH_MAX_HALFKP_OPS 32768
+#define CHESS_TT_SIZE 65536
+#define CHESS_TT_MASK (CHESS_TT_SIZE - 1)
 
 typedef struct HalfkpTraceOp {
     uint8_t perspective;
@@ -369,9 +371,6 @@ typedef struct SearchLightSnapshot {
     int en_passant_square;
     int halfmove_clock;
     int fullmove_number;
-    int legal_moves_cache_count;
-    uint64_t legal_moves_key;
-    int legal_moves_side;
 } SearchLightSnapshot;
 
 typedef struct SearchAccumSnapshot {
@@ -380,12 +379,25 @@ typedef struct SearchAccumSnapshot {
     unsigned char halfkp_active[2][CHESS_HALFKP_FEATURES];
 } SearchAccumSnapshot;
 
+typedef struct TTEntry {
+    uint64_t key;
+    int16_t move;
+    int16_t score;
+    uint8_t depth;
+    uint8_t flag;   // 0=exact, 1=lower, 2=upper
+    uint16_t gen;
+} TTEntry;
+
 #if defined(__GNUC__) || defined(__clang__)
 static __thread SearchTrace* g_search_trace = NULL;
 static __thread SearchTrace g_search_trace_tls;
+static __thread TTEntry g_tt[CHESS_TT_SIZE];
+static __thread uint16_t g_tt_gen = 1;
 #else
 static _Thread_local SearchTrace* g_search_trace = NULL;
 static _Thread_local SearchTrace g_search_trace_tls;
+static _Thread_local TTEntry g_tt[CHESS_TT_SIZE];
+static _Thread_local uint16_t g_tt_gen = 1;
 #endif
 
 /* Read action[idx] respecting the actual numpy dtype (int32 or int64). */
@@ -674,9 +686,6 @@ static inline void search_snapshot_light_save(const ChessEnv* env, SearchLightSn
     snap->en_passant_square = env->en_passant_square;
     snap->halfmove_clock = env->halfmove_clock;
     snap->fullmove_number = env->fullmove_number;
-    snap->legal_moves_cache_count = env->legal_moves_cache_count;
-    snap->legal_moves_key = env->legal_moves_key;
-    snap->legal_moves_side = env->legal_moves_side;
 }
 
 static inline void search_snapshot_light_restore(ChessEnv* env, const SearchLightSnapshot* snap) {
@@ -691,9 +700,7 @@ static inline void search_snapshot_light_restore(ChessEnv* env, const SearchLigh
     env->en_passant_square = snap->en_passant_square;
     env->halfmove_clock = snap->halfmove_clock;
     env->fullmove_number = snap->fullmove_number;
-    env->legal_moves_cache_count = snap->legal_moves_cache_count;
-    env->legal_moves_key = snap->legal_moves_key;
-    env->legal_moves_side = snap->legal_moves_side;
+    env->legal_moves_cache_count = -1;
 }
 
 static inline void search_snapshot_accum_save(const ChessEnv* env, SearchAccumSnapshot* snap) {
@@ -724,6 +731,53 @@ static inline void halfkp_trace_undo_to(ChessEnv* env, SearchTrace* trace, int m
     trace->suppress = 0;
     trace->count = mark;
     trace->overflow = 0;
+}
+
+static inline void tt_bump_generation(void) {
+    g_tt_gen++;
+    if (g_tt_gen == 0) {
+        memset(g_tt, 0, sizeof(g_tt));
+        g_tt_gen = 1;
+    }
+}
+
+static inline TTEntry* tt_get_slot(uint64_t key) {
+    return &g_tt[(uint32_t)key & CHESS_TT_MASK];
+}
+
+static inline int tt_probe(uint64_t key, int depth, int32_t alpha, int32_t beta,
+        int32_t* out_score, int* out_move) {
+    TTEntry* e = tt_get_slot(key);
+    if (e->gen != g_tt_gen || e->key != key) return 0;
+    if (out_move) *out_move = (int)e->move;
+    if ((int)e->depth < depth) return 0;
+
+    int32_t score = (int32_t)e->score;
+    if (e->flag == 0) {
+        if (out_score) *out_score = score;
+        return 1;
+    }
+    if (e->flag == 1 && score >= beta) {
+        if (out_score) *out_score = score;
+        return 1;
+    }
+    if (e->flag == 2 && score <= alpha) {
+        if (out_score) *out_score = score;
+        return 1;
+    }
+    return 0;
+}
+
+static inline void tt_store(uint64_t key, int depth, int flag, int32_t score, int move) {
+    TTEntry* e = tt_get_slot(key);
+    if (score > 32767) score = 32767;
+    if (score < -32768) score = -32768;
+    e->key = key;
+    e->move = (int16_t)move;
+    e->score = (int16_t)score;
+    e->depth = (uint8_t)((depth < 0) ? 0 : ((depth > 255) ? 255 : depth));
+    e->flag = (uint8_t)flag;
+    e->gen = g_tt_gen;
 }
 
 static inline void halfkp_accum_add(ChessEnv* env, int perspective, int feature_idx, int sign) {
@@ -2211,6 +2265,19 @@ static inline void qpol_order_moves(const ChessEnv* env, int moves[], int count)
     }
 }
 
+static inline void qpol_promote_move_front(int moves[], int count, int move) {
+    if (move < 0 || count <= 1) return;
+    for (int i = 0; i < count; i++) {
+        if (moves[i] == move) {
+            if (i == 0) return;
+            int tmp = moves[0];
+            moves[0] = moves[i];
+            moves[i] = tmp;
+            return;
+        }
+    }
+}
+
 static inline int qpol_move_needs_full_accum_snapshot(const ChessEnv* env, int from_sq) {
     int8_t piece = env->board[from_sq];
     if (piece == WK || piece == BK) return 1;
@@ -2225,21 +2292,33 @@ static int32_t qpol_alpha_beta(
     if (depth <= 0) {
         return qpol_value_raw(env) / CHESS_NNUE_FV_SCALE;
     }
+    int32_t alpha_orig = alpha;
+    int tt_move = -1;
+    int32_t tt_score = 0;
+    if (tt_probe(env->zobrist_key, depth, alpha, beta, &tt_score, &tt_move)) {
+        return tt_score;
+    }
 
     int moves[CHESS_MAX_MOVES];
-    int count = generate_legal_moves_cached(env, moves, CHESS_MAX_MOVES);
+    int count = generate_legal_moves(env, moves, CHESS_MAX_MOVES);
     if (count == 0) {
         if (is_in_check(env, env->current_player)) {
             return -kMate + ply;
         }
         return 0;
     }
+    qpol_promote_move_front(moves, count, tt_move);
     if (depth > 1) {
-        qpol_order_moves(env, moves, count);
+        if (tt_move >= 0 && count > 1 && moves[0] == tt_move) {
+            qpol_order_moves(env, moves + 1, count - 1);
+        } else {
+            qpol_order_moves(env, moves, count);
+        }
     }
 
     int side = env->current_player;
     int32_t best = -kMate;
+    int best_move = moves[0];
     for (int i = 0; i < count; i++) {
         int from_sq = moves[i] / 64;
         int to_sq = moves[i] % 64;
@@ -2273,24 +2352,43 @@ static int32_t qpol_alpha_beta(
         }
         search_snapshot_light_restore(env, &light_snap);
 
-        if (score > best) best = score;
+        if (score > best) {
+            best = score;
+            best_move = moves[i];
+        }
         if (score > alpha) alpha = score;
         if (alpha >= beta) break;
     }
 
+    int tt_flag = 0;
+    if (best <= alpha_orig) {
+        tt_flag = 2;
+    } else if (best >= beta) {
+        tt_flag = 1;
+    }
+    tt_store(env->zobrist_key, depth, tt_flag, best, best_move);
     return best;
 }
 
 static int qpol_search_best_move(ChessEnv* env, int* best_from_sq, int* best_to_sq, int32_t* best_score) {
     const int32_t kInf = 32000;
     int moves[CHESS_MAX_MOVES];
-    int count = generate_legal_moves_cached(env, moves, CHESS_MAX_MOVES);
+    int count = generate_legal_moves(env, moves, CHESS_MAX_MOVES);
     if (count <= 0) return 0;
 
     int depth = g_qpol.search_depth;
     if (depth <= 0) depth = 1;
+    tt_bump_generation();
+    int tt_move = -1;
+    int32_t tt_score_unused = 0;
+    (void)tt_probe(env->zobrist_key, depth, -kInf, kInf, &tt_score_unused, &tt_move);
+    qpol_promote_move_front(moves, count, tt_move);
     if (depth > 1) {
-        qpol_order_moves(env, moves, count);
+        if (tt_move >= 0 && count > 1 && moves[0] == tt_move) {
+            qpol_order_moves(env, moves + 1, count - 1);
+        } else {
+            qpol_order_moves(env, moves, count);
+        }
     }
 
     int side = env->current_player;
@@ -2344,6 +2442,7 @@ static int qpol_search_best_move(ChessEnv* env, int* best_from_sq, int* best_to_
         if (score > alpha) alpha = score;
     }
     g_search_trace = prev_trace;
+    tt_store(env->zobrist_key, depth, 0, best, best_move);
 
     if (best_from_sq) *best_from_sq = best_move / 64;
     if (best_to_sq) *best_to_sq = best_move % 64;

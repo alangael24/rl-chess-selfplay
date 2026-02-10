@@ -341,6 +341,53 @@ typedef struct QuantPolicy {
 
 static QuantPolicy g_qpol;
 
+#define CHESS_SEARCH_MAX_HALFKP_OPS 32768
+
+typedef struct HalfkpTraceOp {
+    uint8_t perspective;
+    int32_t feature_idx;
+    int8_t sign;  // +1 activate, -1 deactivate
+} HalfkpTraceOp;
+
+typedef struct SearchTrace {
+    HalfkpTraceOp ops[CHESS_SEARCH_MAX_HALFKP_OPS];
+    int count;
+    int enabled;
+    int suppress;
+    int overflow;
+} SearchTrace;
+
+typedef struct SearchLightSnapshot {
+    int8_t board[64];
+    Bitboard bb_by_type[7];
+    Bitboard bb_by_color[2];
+    Bitboard bb_occ;
+    int piece_count[2][6];
+    uint64_t zobrist_key;
+    int current_player;
+    uint8_t castling_rights;
+    int en_passant_square;
+    int halfmove_clock;
+    int fullmove_number;
+    int legal_moves_cache_count;
+    uint64_t legal_moves_key;
+    int legal_moves_side;
+} SearchLightSnapshot;
+
+typedef struct SearchAccumSnapshot {
+    int16_t nnue_accum[2][CHESS_NNUE_ACCUM];
+    int king_rel_sq[2];
+    unsigned char halfkp_active[2][CHESS_HALFKP_FEATURES];
+} SearchAccumSnapshot;
+
+#if defined(__GNUC__) || defined(__clang__)
+static __thread SearchTrace* g_search_trace = NULL;
+static __thread SearchTrace g_search_trace_tls;
+#else
+static _Thread_local SearchTrace* g_search_trace = NULL;
+static _Thread_local SearchTrace g_search_trace_tls;
+#endif
+
 /* Read action[idx] respecting the actual numpy dtype (int32 or int64). */
 static inline int get_action(const ChessEnv* env, int idx) {
     if (env->action_itemsize == 8)
@@ -599,6 +646,86 @@ static inline int16_t halfkp_fallback_weight(int feature_idx, int dim) {
     return (int16_t)((int)(x & 7u) - 3);
 }
 
+static inline void halfkp_trace_push(int perspective, int feature_idx, int sign) {
+    SearchTrace* trace = g_search_trace;
+    if (!trace || !trace->enabled || trace->suppress) return;
+    if (trace->count >= CHESS_SEARCH_MAX_HALFKP_OPS) {
+        trace->overflow = 1;
+        return;
+    }
+    HalfkpTraceOp* op = &trace->ops[trace->count++];
+    op->perspective = (uint8_t)perspective;
+    op->feature_idx = feature_idx;
+    op->sign = (int8_t)sign;
+}
+
+static inline void halfkp_activate(ChessEnv* env, int perspective, int feature_idx);
+static inline void halfkp_deactivate(ChessEnv* env, int perspective, int feature_idx);
+
+static inline void search_snapshot_light_save(const ChessEnv* env, SearchLightSnapshot* snap) {
+    memcpy(snap->board, env->board, sizeof(snap->board));
+    memcpy(snap->bb_by_type, env->bb_by_type, sizeof(snap->bb_by_type));
+    memcpy(snap->bb_by_color, env->bb_by_color, sizeof(snap->bb_by_color));
+    snap->bb_occ = env->bb_occ;
+    memcpy(snap->piece_count, env->piece_count, sizeof(snap->piece_count));
+    snap->zobrist_key = env->zobrist_key;
+    snap->current_player = env->current_player;
+    snap->castling_rights = env->castling_rights;
+    snap->en_passant_square = env->en_passant_square;
+    snap->halfmove_clock = env->halfmove_clock;
+    snap->fullmove_number = env->fullmove_number;
+    snap->legal_moves_cache_count = env->legal_moves_cache_count;
+    snap->legal_moves_key = env->legal_moves_key;
+    snap->legal_moves_side = env->legal_moves_side;
+}
+
+static inline void search_snapshot_light_restore(ChessEnv* env, const SearchLightSnapshot* snap) {
+    memcpy(env->board, snap->board, sizeof(snap->board));
+    memcpy(env->bb_by_type, snap->bb_by_type, sizeof(snap->bb_by_type));
+    memcpy(env->bb_by_color, snap->bb_by_color, sizeof(snap->bb_by_color));
+    env->bb_occ = snap->bb_occ;
+    memcpy(env->piece_count, snap->piece_count, sizeof(snap->piece_count));
+    env->zobrist_key = snap->zobrist_key;
+    env->current_player = snap->current_player;
+    env->castling_rights = snap->castling_rights;
+    env->en_passant_square = snap->en_passant_square;
+    env->halfmove_clock = snap->halfmove_clock;
+    env->fullmove_number = snap->fullmove_number;
+    env->legal_moves_cache_count = snap->legal_moves_cache_count;
+    env->legal_moves_key = snap->legal_moves_key;
+    env->legal_moves_side = snap->legal_moves_side;
+}
+
+static inline void search_snapshot_accum_save(const ChessEnv* env, SearchAccumSnapshot* snap) {
+    memcpy(snap->nnue_accum, env->nnue_accum, sizeof(snap->nnue_accum));
+    memcpy(snap->king_rel_sq, env->king_rel_sq, sizeof(snap->king_rel_sq));
+    memcpy(snap->halfkp_active, env->halfkp_active, sizeof(snap->halfkp_active));
+}
+
+static inline void search_snapshot_accum_restore(ChessEnv* env, const SearchAccumSnapshot* snap) {
+    memcpy(env->nnue_accum, snap->nnue_accum, sizeof(snap->nnue_accum));
+    memcpy(env->king_rel_sq, snap->king_rel_sq, sizeof(snap->king_rel_sq));
+    memcpy(env->halfkp_active, snap->halfkp_active, sizeof(snap->halfkp_active));
+}
+
+static inline void halfkp_trace_undo_to(ChessEnv* env, SearchTrace* trace, int mark) {
+    if (!trace) return;
+    if (mark < 0) mark = 0;
+    if (mark > trace->count) mark = trace->count;
+    trace->suppress = 1;
+    for (int i = trace->count - 1; i >= mark; i--) {
+        const HalfkpTraceOp* op = &trace->ops[i];
+        if (op->sign > 0) {
+            halfkp_deactivate(env, (int)op->perspective, op->feature_idx);
+        } else {
+            halfkp_activate(env, (int)op->perspective, op->feature_idx);
+        }
+    }
+    trace->suppress = 0;
+    trace->count = mark;
+    trace->overflow = 0;
+}
+
 static inline void halfkp_accum_add(ChessEnv* env, int perspective, int feature_idx, int sign) {
     if (feature_idx < 0 || feature_idx >= CHESS_HALFKP_FEATURES) return;
     int base = feature_idx * CHESS_NNUE_ACCUM;
@@ -614,6 +741,7 @@ static inline void halfkp_activate(ChessEnv* env, int perspective, int feature_i
     if (env->halfkp_active[perspective][feature_idx]) return;
     env->halfkp_active[perspective][feature_idx] = 1;
     halfkp_accum_add(env, perspective, feature_idx, +1);
+    halfkp_trace_push(perspective, feature_idx, +1);
 }
 
 static inline void halfkp_deactivate(ChessEnv* env, int perspective, int feature_idx) {
@@ -621,6 +749,7 @@ static inline void halfkp_deactivate(ChessEnv* env, int perspective, int feature
     if (!env->halfkp_active[perspective][feature_idx]) return;
     env->halfkp_active[perspective][feature_idx] = 0;
     halfkp_accum_add(env, perspective, feature_idx, -1);
+    halfkp_trace_push(perspective, feature_idx, -1);
 }
 
 static inline int find_king_by_scan(const ChessEnv* env, int player) {
@@ -2041,7 +2170,57 @@ static inline int qpol_action_from_abs_sq(int player, int abs_sq) {
     return (player == 0) ? abs_sq : flip_sq(abs_sq);
 }
 
-static int32_t qpol_alpha_beta(ChessEnv* env, int depth, int ply, int32_t alpha, int32_t beta) {
+static inline int qpol_move_order_score(const ChessEnv* env, int move) {
+    int from_sq = move / 64;
+    int to_sq = move % 64;
+    int8_t mover = env->board[from_sq];
+    int8_t captured = env->board[to_sq];
+    int player = env->current_player;
+
+    int mtype = mover;
+    if (mtype >= BP) mtype -= 6;
+    if (mtype == WP && to_sq == env->en_passant_square) {
+        captured = (player == 0) ? BP : WP;
+    }
+
+    int score = 0;
+    if (captured != EMPTY) {
+        score += 10000 + captured_piece_value(captured);
+        score -= captured_piece_value(mover) / 16;
+    }
+    if (is_promotion_move((ChessEnv*)env, from_sq, to_sq)) {
+        score += 9000;
+    }
+    return score;
+}
+
+static inline void qpol_order_moves(const ChessEnv* env, int moves[], int count) {
+    if (count <= 1) return;
+    // Insertion sort is fast enough for <= 256 moves and keeps code simple.
+    for (int i = 1; i < count; i++) {
+        int mv = moves[i];
+        int mv_score = qpol_move_order_score(env, mv);
+        int j = i - 1;
+        while (j >= 0) {
+            int s = qpol_move_order_score(env, moves[j]);
+            if (s >= mv_score) break;
+            moves[j + 1] = moves[j];
+            j--;
+        }
+        moves[j + 1] = mv;
+    }
+}
+
+static inline int qpol_move_needs_full_accum_snapshot(const ChessEnv* env, int from_sq) {
+    int8_t piece = env->board[from_sq];
+    if (piece == WK || piece == BK) return 1;
+    if (env->king_rel_sq[0] < 0 || env->king_rel_sq[1] < 0) return 1;
+    return 0;
+}
+
+static int32_t qpol_alpha_beta(
+        ChessEnv* env, SearchTrace* trace,
+        int depth, int ply, int32_t alpha, int32_t beta) {
     const int32_t kMate = 30000;
     if (depth <= 0) {
         return qpol_value_raw(env) / CHESS_NNUE_FV_SCALE;
@@ -2055,20 +2234,44 @@ static int32_t qpol_alpha_beta(ChessEnv* env, int depth, int ply, int32_t alpha,
         }
         return 0;
     }
+    if (depth > 1) {
+        qpol_order_moves(env, moves, count);
+    }
 
     int side = env->current_player;
     int32_t best = -kMate;
     for (int i = 0; i < count; i++) {
-        ChessEnv snapshot = *env;
         int from_sq = moves[i] / 64;
         int to_sq = moves[i] % 64;
+        int trace_mark = trace ? trace->count : 0;
+        int use_full_snapshot =
+            qpol_move_needs_full_accum_snapshot(env, from_sq) ||
+            !trace ||
+            trace->overflow;
+        SearchLightSnapshot light_snap;
+        SearchAccumSnapshot accum_snap;
+
+        search_snapshot_light_save(env, &light_snap);
+        if (use_full_snapshot) {
+            search_snapshot_accum_save(env, &accum_snap);
+        }
 
         apply_move_ex(env, from_sq, to_sq, EMPTY);
         env->current_player = 1 - side;
         halfkp_update_turn_feature(env, side, env->current_player);
 
-        int32_t score = -qpol_alpha_beta(env, depth - 1, ply + 1, -beta, -alpha);
-        *env = snapshot;
+        int32_t score = -qpol_alpha_beta(env, trace, depth - 1, ply + 1, -beta, -alpha);
+
+        if (use_full_snapshot) {
+            search_snapshot_accum_restore(env, &accum_snap);
+            if (trace) {
+                trace->count = trace_mark;
+                trace->overflow = 0;
+            }
+        } else {
+            halfkp_trace_undo_to(env, trace, trace_mark);
+        }
+        search_snapshot_light_restore(env, &light_snap);
 
         if (score > best) best = score;
         if (score > alpha) alpha = score;
@@ -2086,6 +2289,9 @@ static int qpol_search_best_move(ChessEnv* env, int* best_from_sq, int* best_to_
 
     int depth = g_qpol.search_depth;
     if (depth <= 0) depth = 1;
+    if (depth > 1) {
+        qpol_order_moves(env, moves, count);
+    }
 
     int side = env->current_player;
     int32_t alpha = -kInf;
@@ -2093,17 +2299,43 @@ static int qpol_search_best_move(ChessEnv* env, int* best_from_sq, int* best_to_
     int32_t best = -kInf;
     int best_move = moves[0];
 
+    SearchTrace* trace = &g_search_trace_tls;
+    trace->count = 0;
+    trace->enabled = 1;
+    trace->suppress = 0;
+    trace->overflow = 0;
+    SearchTrace* prev_trace = g_search_trace;
+    g_search_trace = trace;
+
     for (int i = 0; i < count; i++) {
-        ChessEnv snapshot = *env;
         int from_sq = moves[i] / 64;
         int to_sq = moves[i] % 64;
+        int trace_mark = trace->count;
+        int use_full_snapshot =
+            qpol_move_needs_full_accum_snapshot(env, from_sq) ||
+            trace->overflow;
+        SearchLightSnapshot light_snap;
+        SearchAccumSnapshot accum_snap;
+
+        search_snapshot_light_save(env, &light_snap);
+        if (use_full_snapshot) {
+            search_snapshot_accum_save(env, &accum_snap);
+        }
 
         apply_move_ex(env, from_sq, to_sq, EMPTY);
         env->current_player = 1 - side;
         halfkp_update_turn_feature(env, side, env->current_player);
 
-        int32_t score = -qpol_alpha_beta(env, depth - 1, 1, -beta, -alpha);
-        *env = snapshot;
+        int32_t score = -qpol_alpha_beta(env, trace, depth - 1, 1, -beta, -alpha);
+
+        if (use_full_snapshot) {
+            search_snapshot_accum_restore(env, &accum_snap);
+            trace->count = trace_mark;
+            trace->overflow = 0;
+        } else {
+            halfkp_trace_undo_to(env, trace, trace_mark);
+        }
+        search_snapshot_light_restore(env, &light_snap);
 
         if (score > best) {
             best = score;
@@ -2111,6 +2343,7 @@ static int qpol_search_best_move(ChessEnv* env, int* best_from_sq, int* best_to_
         }
         if (score > alpha) alpha = score;
     }
+    g_search_trace = prev_trace;
 
     if (best_from_sq) *best_from_sq = best_move / 64;
     if (best_to_sq) *best_to_sq = best_move % 64;

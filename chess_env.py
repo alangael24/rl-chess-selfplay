@@ -39,7 +39,7 @@ class Chess(pufferlib.PufferEnv):
                  reward_capture_bonus=0.0, reward_check_bonus=0.0,
                  reward_repetition=0.0, reward_material=0.0,
                  reward_position=0.0, reward_castling=0.0,
-                 reward_draw=0.0, reward_see_hanging=0.0,
+                 reward_draw=0.0, reward_truncation=None, reward_see_hanging=0.0,
                  enable_50_move_rule=1,
                  enable_threefold_repetition=1,
                  use_native_qpolicy=0,
@@ -61,6 +61,9 @@ class Chess(pufferlib.PufferEnv):
 
         super().__init__(buf=buf)
 
+        if reward_truncation is None:
+            reward_truncation = reward_draw
+
         init_kwargs = dict(
             max_steps=max_steps,
             illegal_move_penalty=illegal_move_penalty,
@@ -75,6 +78,7 @@ class Chess(pufferlib.PufferEnv):
             reward_position=reward_position,
             reward_castling=reward_castling,
             reward_draw=reward_draw,
+            reward_truncation=reward_truncation,
             reward_see_hanging=reward_see_hanging,
             enable_50_move_rule=enable_50_move_rule,
             enable_threefold_repetition=enable_threefold_repetition,

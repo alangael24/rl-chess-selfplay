@@ -203,6 +203,7 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     float reward_position      = (float)unpack_kwarg(kwargs, "reward_position", 0.0);
     float reward_castling      = (float)unpack_kwarg(kwargs, "reward_castling", 0.0);
     float reward_draw          = (float)unpack_kwarg(kwargs, "reward_draw", 0.0);
+    float reward_truncation    = (float)unpack_kwarg(kwargs, "reward_truncation", reward_draw);
     int enable_50_move_rule    = (int)unpack_kwarg(kwargs, "enable_50_move_rule", 1);
     int enable_threefold_repetition = (int)unpack_kwarg(kwargs, "enable_threefold_repetition", 1);
     int qpolicy_root_cap       = (int)unpack_kwarg(kwargs, "qpolicy_root_cap", CHESS_QPOL_ROOT_CAP_DEFAULT);
@@ -319,6 +320,7 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         game->reward_position = reward_position;
         game->reward_castling = reward_castling;
         game->reward_draw = reward_draw;
+        game->reward_truncation = reward_truncation;
         game->enable_50_move_rule = enable_50_move_rule;
         game->enable_threefold_repetition = enable_threefold_repetition;
         game->qpol_root_cap = qpolicy_root_cap;

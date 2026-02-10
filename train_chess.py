@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 import sys
 import argparse
+import os
 
 import pufferlib
 import pufferlib.pytorch
@@ -102,6 +103,25 @@ def _clamp01(x):
     return float(max(0.0, min(1.0, x)))
 
 
+def resolve_fen_file(cli_fen_file):
+    """Pick an explicit FEN file or a local default curriculum file."""
+    if cli_fen_file:
+        if os.path.exists(cli_fen_file):
+            return cli_fen_file
+        raise FileNotFoundError(f"FEN curriculum file not found: {cli_fen_file}")
+
+    default_candidates = (
+        "curriculum_mixed.txt",
+        "curriculum_mate13.txt",
+        "curriculum_mates.txt",
+        "curriculum_train_checked.txt",
+    )
+    for candidate in default_candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
 def parse_curriculum_schedule(spec):
     """Parse schedule like: '0:0.9,50:0.6,100:0.3,150:0.1,200:0.0'."""
     if spec is None:
@@ -163,13 +183,31 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument('--num-games', type=int, default=1024)
     parser.add_argument('--fen-file', type=str, default=None,
-                        help='Path to FEN curriculum file')
-    parser.add_argument('--fen-curric-pct', type=float, default=0.0,
-                        help='Initial probability of resetting from curriculum FENs')
+                        help='Path to FEN curriculum file. If omitted, auto-picks a local curriculum_*.txt when present')
+    parser.add_argument('--fen-curric-pct', type=float, default=-1.0,
+                        help='Initial probability of resetting from curriculum FENs. Default: 0.9 if a FEN file is active, else 0.0')
     parser.add_argument('--fen-curric-schedule', type=str, default='',
                         help='Decay schedule epoch:pct pairs, e.g. 0:0.9,50:0.6,100:0.3,150:0.1,200:0.0')
     parser.add_argument('--no-curriculum-decay', action='store_true',
                         help='Keep fen_curric_pct fixed (ignore schedule)')
+    parser.add_argument('--reward-draw', type=float, default=-0.03,
+                        help='Reward for draw outcomes (repetition/stalemate/50-move/insufficient)')
+    parser.add_argument('--reward-truncation', type=float, default=-0.10,
+                        help='Reward when max_steps truncation is reached')
+    parser.add_argument('--reward-repetition', type=float, default=-0.01,
+                        help='Per-move penalty on repeated positions (occurrence >= 2)')
+    parser.add_argument('--reward-material', type=float, default=0.005,
+                        help='Material delta shaping scale')
+    parser.add_argument('--reward-position', type=float, default=0.002,
+                        help='Positional delta shaping scale (PST-based)')
+    parser.add_argument('--reward-capture-bonus', type=float, default=0.002,
+                        help='Extra reward bonus for captures')
+    parser.add_argument('--reward-check-bonus', type=float, default=0.001,
+                        help='Extra reward bonus when giving check')
+    parser.add_argument('--reward-castling', type=float, default=0.005,
+                        help='One-time castling bonus')
+    parser.add_argument('--reward-see-hanging', type=float, default=-0.005,
+                        help='Penalty scale for hanging-move SEE scores (must be <= 0)')
     cli_args = parser.parse_args()
 
     print("=" * 60)
@@ -208,7 +246,11 @@ if __name__ == "__main__":
     NUM_AGENTS = NUM_GAMES  # 1 agent per game
     EVAL_EVERY = 10
 
-    fen_curric_pct = _clamp01(cli_args.fen_curric_pct)
+    fen_file = resolve_fen_file(cli_args.fen_file)
+    if cli_args.fen_curric_pct < 0.0:
+        fen_curric_pct = 0.9 if fen_file else 0.0
+    else:
+        fen_curric_pct = _clamp01(cli_args.fen_curric_pct)
 
     vecenv = pufferlib.vector.make(
         Chess,
@@ -220,8 +262,17 @@ if __name__ == "__main__":
             'reward_invalid_move': -0.01,
             'reward_valid_piece': 0.0,
             'reward_valid_move': 0.0,
+            'reward_capture_bonus': cli_args.reward_capture_bonus,
+            'reward_check_bonus': cli_args.reward_check_bonus,
+            'reward_repetition': cli_args.reward_repetition,
+            'reward_material': cli_args.reward_material,
+            'reward_position': cli_args.reward_position,
+            'reward_castling': cli_args.reward_castling,
+            'reward_draw': cli_args.reward_draw,
+            'reward_truncation': cli_args.reward_truncation,
+            'reward_see_hanging': cli_args.reward_see_hanging,
             'fen_curric_pct': fen_curric_pct,
-            'fen_file': cli_args.fen_file,
+            'fen_file': fen_file,
         },
         num_envs=1,
         backend=pufferlib.PufferEnv,
@@ -229,7 +280,7 @@ if __name__ == "__main__":
     vecenv.agents_per_batch = NUM_AGENTS
 
     curriculum = None
-    if cli_args.fen_file:
+    if fen_file:
         schedule = []
         if not cli_args.no_curriculum_decay:
             schedule = parse_curriculum_schedule(cli_args.fen_curric_schedule)
@@ -242,7 +293,7 @@ if __name__ == "__main__":
         if schedule:
             curriculum = FenCurriculumController(vecenv, schedule)
             curriculum.maybe_apply(epoch=0, force=True)
-            print(f"  Curriculum FEN file: {cli_args.fen_file}")
+            print(f"  Curriculum FEN file: {fen_file}")
             print(f"  Curriculum schedule: {schedule}")
 
     device = args['train'].get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
@@ -253,6 +304,12 @@ if __name__ == "__main__":
     print(f"  Games: {NUM_GAMES}")
     print(f"  Agents: {NUM_AGENTS}")
     print(f"  Eval every: {EVAL_EVERY} epochs")
+    print(f"  reward_draw={cli_args.reward_draw} reward_truncation={cli_args.reward_truncation} reward_repetition={cli_args.reward_repetition}")
+    print(f"  shaping: material={cli_args.reward_material} position={cli_args.reward_position} capture={cli_args.reward_capture_bonus} check={cli_args.reward_check_bonus} castling={cli_args.reward_castling} see={cli_args.reward_see_hanging}")
+    if fen_file:
+        print(f"  Curriculum active: fen_file={fen_file} fen_curric_pct={fen_curric_pct:.3f}")
+    else:
+        print("  Curriculum active: no (no FEN file found/provided)")
     print("=" * 60)
 
     trainer = pufferl.PuffeRL(args['train'], vecenv, policy)

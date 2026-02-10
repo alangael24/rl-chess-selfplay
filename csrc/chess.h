@@ -292,6 +292,7 @@ typedef struct ChessEnv {
     float reward_position;        // default 0.0 - scale for positional delta per move
     float reward_castling;        // default 0.0 - one-time castling bonus
     float reward_draw;            // default 0.0 - reward for draw outcomes
+    float reward_truncation;      // default reward_draw - reward when max_steps is reached
     int enable_50_move_rule;      // 1=enabled, 0=disabled (default 1)
     int enable_threefold_repetition; // 1=enabled, 0=disabled (default 1)
 
@@ -2943,6 +2944,7 @@ void init(ChessEnv* env) {
     env->reward_position = 0.0f;
     env->reward_castling = 0.0f;
     env->reward_draw = 0.0f;
+    env->reward_truncation = 0.0f;
     env->reward_see_hanging = 0.0f;
     env->enable_50_move_rule = 1;
     env->enable_threefold_repetition = 1;
@@ -3082,7 +3084,7 @@ void c_step(ChessEnv* env) {
 
     env->step_count++;
     if (env->step_count >= env->max_steps && env->terminals[0] == 0) {
-        env->rewards[0] += env->reward_draw;
+        env->rewards[0] += env->reward_truncation;
         env->terminals[0] = 1;
         env->log.draws += 1;
         log_episode(env);

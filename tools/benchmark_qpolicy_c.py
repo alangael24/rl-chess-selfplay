@@ -24,9 +24,14 @@ def main():
     parser.add_argument("--num-envs", type=int, default=512)
     parser.add_argument("--seconds", type=float, default=5.0)
     parser.add_argument("--max-steps", type=int, default=256)
+    parser.add_argument("--qpolicy-root-cap", type=int, default=12)
     args = parser.parse_args()
 
-    env = Chess(num_envs=args.num_envs, max_steps=args.max_steps)
+    env = Chess(
+        num_envs=args.num_envs,
+        max_steps=args.max_steps,
+        qpolicy_root_cap=args.qpolicy_root_cap,
+    )
     env.reset(seed=123)
     env.load_qpolicy(args.qpolicy)
 

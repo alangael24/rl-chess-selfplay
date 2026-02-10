@@ -205,6 +205,7 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     float reward_draw          = (float)unpack_kwarg(kwargs, "reward_draw", 0.0);
     int enable_50_move_rule    = (int)unpack_kwarg(kwargs, "enable_50_move_rule", 1);
     int enable_threefold_repetition = (int)unpack_kwarg(kwargs, "enable_threefold_repetition", 1);
+    int qpolicy_root_cap       = (int)unpack_kwarg(kwargs, "qpolicy_root_cap", CHESS_QPOL_ROOT_CAP_DEFAULT);
     float reward_see_hanging   = (float)unpack_kwarg(kwargs, "reward_see_hanging", 0.0);
     if (reward_see_hanging > 0.0f) reward_see_hanging = 0.0f;  // must be <= 0 (penalty)
     float fen_curric_pct       = (float)unpack_kwarg(kwargs, "fen_curric_pct", 0.0);
@@ -320,6 +321,7 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         game->reward_draw = reward_draw;
         game->enable_50_move_rule = enable_50_move_rule;
         game->enable_threefold_repetition = enable_threefold_repetition;
+        game->qpol_root_cap = qpolicy_root_cap;
         game->reward_see_hanging = reward_see_hanging;
         game->use_curriculum = (fen_curric_pct > 0.0f && vec->fen_count > 0) ? 1 : 0;
         game->obs_stride = obs_stride_bytes;

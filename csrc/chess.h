@@ -55,6 +55,7 @@
 #define CHESS_NNUE_HIDDEN 32
 #define CHESS_NNUE_FV_SCALE 16
 #define CHESS_QPOL_SEARCH_DEPTH_DEFAULT 1
+#define CHESS_QPOL_ROOT_CAP_DEFAULT 12
 
 #define EMPTY 0
 #define WP 1
@@ -303,6 +304,7 @@ typedef struct ChessEnv {
 
     // FEN curriculum
     int use_curriculum;
+    int qpol_root_cap;
 
     // SEE/hanging reward shaping
     float reward_see_hanging;         // default 0.0 - penalty for hanging pieces
@@ -420,10 +422,10 @@ static inline void set_action(ChessEnv* env, int idx, int action) {
 // Native NNUE integer inference helpers
 // ============================================================================
 
-static inline int8_t clamp_relu_i8(int v) {
+static inline uint8_t clamp_relu_u8(int v) {
     if (v <= 0) return 0;
     if (v > 127) return 127;
-    return (int8_t)v;
+    return (uint8_t)v;
 }
 
 static inline int16_t clamp_i16(int32_t v) {
@@ -432,7 +434,7 @@ static inline int16_t clamp_i16(int32_t v) {
     return (int16_t)v;
 }
 
-static inline int32_t dot_i8_i8_scalar(const int8_t* a, const int8_t* b, int n) {
+static inline int32_t dot_u8_s8_scalar(const uint8_t* a, const int8_t* b, int n) {
     int32_t s = 0;
     for (int i = 0; i < n; i++) {
         s += (int32_t)a[i] * (int32_t)b[i];
@@ -441,16 +443,16 @@ static inline int32_t dot_i8_i8_scalar(const int8_t* a, const int8_t* b, int n) 
 }
 
 #ifdef __AVX2__
-static inline int32_t dot_i8_i8_avx2(const int8_t* a, const int8_t* b, int n) {
+static inline int32_t dot_u8_s8_avx2(const uint8_t* a, const int8_t* b, int n) {
     __m256i vacc = _mm256_setzero_si256();
     int i = 0;
-    for (; i + 16 <= n; i += 16) {
-        __m128i va8 = _mm_loadu_si128((const __m128i*)(a + i));
-        __m128i vb8 = _mm_loadu_si128((const __m128i*)(b + i));
-        __m256i va16 = _mm256_cvtepi8_epi16(va8);
-        __m256i vb16 = _mm256_cvtepi8_epi16(vb8);
-        __m256i vmadd = _mm256_madd_epi16(va16, vb16);
-        vacc = _mm256_add_epi32(vacc, vmadd);
+    const __m256i ones = _mm256_set1_epi16(1);
+    for (; i + 32 <= n; i += 32) {
+        __m256i va = _mm256_loadu_si256((const __m256i*)(a + i));
+        __m256i vb = _mm256_loadu_si256((const __m256i*)(b + i));
+        __m256i pair_sums = _mm256_maddubs_epi16(va, vb);
+        __m256i quad_sums = _mm256_madd_epi16(pair_sums, ones);
+        vacc = _mm256_add_epi32(vacc, quad_sums);
     }
     int32_t tmp[8];
     _mm256_storeu_si256((__m256i*)tmp, vacc);
@@ -462,11 +464,11 @@ static inline int32_t dot_i8_i8_avx2(const int8_t* a, const int8_t* b, int n) {
 }
 #endif
 
-static inline int32_t dot_i8_i8(const int8_t* a, const int8_t* b, int n) {
+static inline int32_t dot_u8_s8(const uint8_t* a, const int8_t* b, int n) {
 #ifdef __AVX2__
-    if (g_qpol.use_avx2) return dot_i8_i8_avx2(a, b, n);
+    if (g_qpol.use_avx2) return dot_u8_s8_avx2(a, b, n);
 #endif
-    return dot_i8_i8_scalar(a, b, n);
+    return dot_u8_s8_scalar(a, b, n);
 }
 
 static inline void qpol_clear(void) {
@@ -483,19 +485,19 @@ static inline int qpol_is_loaded(void) {
     return g_qpol.loaded != 0;
 }
 
-static inline int8_t nnue_clip_input(int16_t v) {
+static inline uint8_t nnue_clip_input(int16_t v) {
     if (v <= 0) return 0;
     if (v > 127) return 127;
-    return (int8_t)v;
+    return (uint8_t)v;
 }
 
 static inline int32_t qpol_value_raw(const ChessEnv* env) {
     int stm = env->current_player;
     int opp = 1 - stm;
 
-    int8_t x[CHESS_NNUE_INPUT];
-    int8_t h1[CHESS_NNUE_HIDDEN];
-    int8_t h2[CHESS_NNUE_HIDDEN];
+    uint8_t x[CHESS_NNUE_INPUT];
+    uint8_t h1[CHESS_NNUE_HIDDEN];
+    uint8_t h2[CHESS_NNUE_HIDDEN];
 
     for (int i = 0; i < CHESS_NNUE_ACCUM; i++) {
         x[i] = nnue_clip_input(env->nnue_accum[stm][i]);
@@ -504,17 +506,17 @@ static inline int32_t qpol_value_raw(const ChessEnv* env) {
 
     for (int o = 0; o < CHESS_NNUE_HIDDEN; o++) {
         const int8_t* row = g_qpol.l1_w + o * CHESS_NNUE_INPUT;
-        int32_t acc = g_qpol.l1_b[o] + dot_i8_i8(x, row, CHESS_NNUE_INPUT);
-        h1[o] = clamp_relu_i8(acc);
+        int32_t acc = g_qpol.l1_b[o] + dot_u8_s8(x, row, CHESS_NNUE_INPUT);
+        h1[o] = clamp_relu_u8(acc);
     }
 
     for (int o = 0; o < CHESS_NNUE_HIDDEN; o++) {
         const int8_t* row = g_qpol.l2_w + o * CHESS_NNUE_HIDDEN;
-        int32_t acc = g_qpol.l2_b[o] + dot_i8_i8(h1, row, CHESS_NNUE_HIDDEN);
-        h2[o] = clamp_relu_i8(acc);
+        int32_t acc = g_qpol.l2_b[o] + dot_u8_s8(h1, row, CHESS_NNUE_HIDDEN);
+        h2[o] = clamp_relu_u8(acc);
     }
 
-    return g_qpol.out_b + dot_i8_i8(h2, g_qpol.out_w, CHESS_NNUE_HIDDEN);
+    return g_qpol.out_b + dot_u8_s8(h2, g_qpol.out_w, CHESS_NNUE_HIDDEN);
 }
 
 static inline float qpol_value_eval(const ChessEnv* env) {
@@ -1486,7 +1488,8 @@ static void record_position_hash(ChessEnv* env) {
 static int count_position_occurrences(ChessEnv* env) {
     uint64_t current = env->zobrist_key;
     int count = 0;
-    for (int i = 0; i < env->position_history_count; i++) {
+    // Side-to-move is part of zobrist_key, so only same-parity plies can match.
+    for (int i = env->position_history_count - 1; i >= 0; i -= 2) {
         if (env->position_history[i] == current) {
             count++;
         }
@@ -2156,7 +2159,10 @@ static void apply_move(ChessEnv* env, int from_sq, int to_sq) {
 
 static int check_game_end(ChessEnv* env, int has_legal) {
     // Threefold repetition
-    if (env->enable_threefold_repetition && check_threefold_repetition(env)) {
+    // Earliest possible third occurrence is after 8 plies from initial position.
+    if (env->enable_threefold_repetition &&
+        env->position_history_count >= 9 &&
+        check_threefold_repetition(env)) {
         return GAME_REPETITION;
     }
 
@@ -2263,6 +2269,33 @@ static inline void qpol_order_moves(const ChessEnv* env, int moves[], int count)
         }
         moves[j + 1] = mv;
     }
+}
+
+static inline int qpol_prune_root_moves(const ChessEnv* env, int moves[], int count, int cap) {
+    if (cap <= 0 || count <= cap) return count;
+    int scores[CHESS_MAX_MOVES];
+    for (int i = 0; i < count; i++) {
+        scores[i] = qpol_move_order_score(env, moves[i]);
+    }
+    for (int i = 0; i < cap; i++) {
+        int best = i;
+        int best_score = scores[i];
+        for (int j = i + 1; j < count; j++) {
+            if (scores[j] > best_score) {
+                best = j;
+                best_score = scores[j];
+            }
+        }
+        if (best != i) {
+            int mv_tmp = moves[i];
+            moves[i] = moves[best];
+            moves[best] = mv_tmp;
+            int sc_tmp = scores[i];
+            scores[i] = scores[best];
+            scores[best] = sc_tmp;
+        }
+    }
+    return cap;
 }
 
 static inline void qpol_promote_move_front(int moves[], int count, int move) {
@@ -2378,17 +2411,27 @@ static int qpol_search_best_move(ChessEnv* env, int* best_from_sq, int* best_to_
 
     int depth = g_qpol.search_depth;
     if (depth <= 0) depth = 1;
-    tt_bump_generation();
+    int root_cap = env->qpol_root_cap;
+    if (root_cap < 0) root_cap = 0;
+    if (root_cap > CHESS_MAX_MOVES) root_cap = CHESS_MAX_MOVES;
+    int use_recursive = (depth > 1);
     int tt_move = -1;
     int32_t tt_score_unused = 0;
-    (void)tt_probe(env->zobrist_key, depth, -kInf, kInf, &tt_score_unused, &tt_move);
-    qpol_promote_move_front(moves, count, tt_move);
-    if (depth > 1) {
+
+    if (use_recursive) {
+        tt_bump_generation();
+        (void)tt_probe(env->zobrist_key, depth, -kInf, kInf, &tt_score_unused, &tt_move);
+        qpol_promote_move_front(moves, count, tt_move);
         if (tt_move >= 0 && count > 1 && moves[0] == tt_move) {
             qpol_order_moves(env, moves + 1, count - 1);
         } else {
             qpol_order_moves(env, moves, count);
         }
+        if (root_cap > 0 && count > root_cap) {
+            count = root_cap;
+        }
+    } else if (root_cap > 0 && count > root_cap) {
+        count = qpol_prune_root_moves(env, moves, count, root_cap);
     }
 
     int side = env->current_player;
@@ -2424,7 +2467,12 @@ static int qpol_search_best_move(ChessEnv* env, int* best_from_sq, int* best_to_
         env->current_player = 1 - side;
         halfkp_update_turn_feature(env, side, env->current_player);
 
-        int32_t score = -qpol_alpha_beta(env, trace, depth - 1, 1, -beta, -alpha);
+        int32_t score;
+        if (use_recursive) {
+            score = -qpol_alpha_beta(env, trace, depth - 1, 1, -beta, -alpha);
+        } else {
+            score = -(qpol_value_raw(env) / CHESS_NNUE_FV_SCALE);
+        }
 
         if (use_full_snapshot) {
             search_snapshot_accum_restore(env, &accum_snap);
@@ -2439,10 +2487,12 @@ static int qpol_search_best_move(ChessEnv* env, int* best_from_sq, int* best_to_
             best = score;
             best_move = moves[i];
         }
-        if (score > alpha) alpha = score;
+        if (use_recursive && score > alpha) alpha = score;
     }
     g_search_trace = prev_trace;
-    tt_store(env->zobrist_key, depth, 0, best, best_move);
+    if (use_recursive) {
+        tt_store(env->zobrist_key, depth, 0, best, best_move);
+    }
 
     if (best_from_sq) *best_from_sq = best_move / 64;
     if (best_to_sq) *best_to_sq = best_move % 64;
@@ -2525,14 +2575,21 @@ static int process_player_action(ChessEnv* env, int action, int player) {
             return 0;
         }
 
-        int all_legal[CHESS_MAX_MOVES];
-        int num_legal = generate_legal_moves_cached(env, all_legal, CHESS_MAX_MOVES);
+        // Native qpolicy fast-path: the search already produced a legal move.
+        // Avoid regenerating the full legal move list on phase-0.
+        if (ps->planned_valid && ps->planned_from_sq == abs_sq) {
+            ps->valid_dest_count = 1;
+            ps->valid_dest_moves[0] = ps->planned_from_sq * 64 + ps->planned_to_sq;
+        } else {
+            int all_legal[CHESS_MAX_MOVES];
+            int num_legal = generate_legal_moves_cached(env, all_legal, CHESS_MAX_MOVES);
 
-        ps->valid_dest_count = 0;
-        for (int i = 0; i < num_legal; i++) {
-            int from = all_legal[i] / 64;
-            if (from == abs_sq) {
-                ps->valid_dest_moves[ps->valid_dest_count++] = all_legal[i];
+            ps->valid_dest_count = 0;
+            for (int i = 0; i < num_legal; i++) {
+                int from = all_legal[i] / 64;
+                if (from == abs_sq) {
+                    ps->valid_dest_moves[ps->valid_dest_count++] = all_legal[i];
+                }
             }
         }
 
@@ -2607,11 +2664,17 @@ static int process_player_action(ChessEnv* env, int action, int player) {
         }
 
         int opp_player = 1 - player;
-        int mat_before = compute_material_score(env, player) - compute_material_score(env, opp_player);
-        int pos_before = compute_positional_score(env, player) - compute_positional_score(env, opp_player);
+        int mat_before = 0;
+        int pos_before = 0;
+        if (env->reward_material != 0.0f) {
+            mat_before = compute_material_score(env, player) - compute_material_score(env, opp_player);
+        }
+        if (env->reward_position != 0.0f) {
+            pos_before = compute_positional_score(env, player) - compute_positional_score(env, opp_player);
+        }
 
         int is_castling = 0;
-        if (mtype == WK) {
+        if (env->reward_castling != 0.0f && mtype == WK) {
             int from_col_val = sq_col(from_sq);
             int to_col_val = sq_col(to_sq);
             int col_diff = to_col_val - from_col_val;
@@ -2884,6 +2947,7 @@ void init(ChessEnv* env) {
     env->enable_50_move_rule = 1;
     env->enable_threefold_repetition = 1;
     env->use_curriculum = 0;
+    env->qpol_root_cap = CHESS_QPOL_ROOT_CAP_DEFAULT;
     env->king_rel_sq[0] = -1;
     env->king_rel_sq[1] = -1;
     memset(env->nnue_accum, 0, sizeof(env->nnue_accum));

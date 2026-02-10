@@ -44,6 +44,7 @@ class Chess(pufferlib.PufferEnv):
                  enable_threefold_repetition=1,
                  use_native_qpolicy=0,
                  qpolicy_path=None,
+                 qpolicy_root_cap=12,
                  fen_file=None, fen_curric_pct=0.0,
                  buf=None, seed=0):
 
@@ -77,6 +78,7 @@ class Chess(pufferlib.PufferEnv):
             reward_see_hanging=reward_see_hanging,
             enable_50_move_rule=enable_50_move_rule,
             enable_threefold_repetition=enable_threefold_repetition,
+            qpolicy_root_cap=qpolicy_root_cap,
             fen_curric_pct=fen_curric_pct,
             num_games=num_envs,
         )
